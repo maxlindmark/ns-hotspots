@@ -1,0 +1,1052 @@
+---
+title: "Processing DATRAS and Norwegian data for model fitting"
+author: "Max Lindmark"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format: 
+  html:
+    toc: true
+    page-layout: full
+    embed-resources: true
+knitr: 
+  opts_chunk:
+    fig.align: center
+    out-width: 80%
+editor: source
+execute: 
+  echo: true
+  eval: true
+  cache: false
+---
+
+```{r}
+#| warning: false
+#| message: false
+
+library(concaveman)
+library(marmap)
+library(forcats)
+library(stringr)
+library(sdmTMB)
+library(tidyr)
+library(dplyr)
+library(purrr)
+library(ggplot2)
+library(rnaturalearth)
+library(sf)
+library(readr)
+library(ggsidekick)
+theme_set(theme_sleek())
+library(viridis)
+
+home <- here::here()
+
+# Convert lat/lon to ETRS89-LAEA (EPSG:3035) projected coordinates to minimize distortion in the domain,
+# which is important because the model estimates the range of spatial autocorrelation,
+# specifically distance where correlation <0.13
+# Change to  them from metres to kilometres to help estimation
+crs_lcc <- 3035 # ETRS89-LAEA
+
+# to_lcc <- function(df, lon = "lon", lat = "lat") {
+#   df |>
+#     sf::st_as_sf(coords = c(lon, lat), crs = 4326) |>
+#     sf::st_transform(crs_lcc) |>
+#     dplyr::mutate(
+#       X = sf::st_coordinates(geometry)[, 1] / 1000,
+#       Y = sf::st_coordinates(geometry)[, 2] / 1000
+#     ) |>
+#     sf::st_drop_geometry()
+# }
+
+to_lcc <- function(df, lon = "lon", lat = "lat") {
+  df |>
+    sf::st_as_sf(
+      coords = c(lon, lat),
+      crs = 4326,
+      remove = FALSE
+    ) |>
+    sf::st_transform(crs_lcc) |>
+    dplyr::mutate(
+      X = sf::st_coordinates(geometry)[, 1] / 1000,
+      Y = sf::st_coordinates(geometry)[, 2] / 1000
+    ) |>
+    sf::st_drop_geometry()
+}
+
+# For map plots
+world <- ne_countries(scale = "medium", returnclass = "sf")
+world_lcc <- world |> st_transform(crs = crs_lcc)
+```
+
+```{r}
+#| warning: false
+#| message: false
+
+# Load data from DATRAS sent to me as RData, one for each species.
+# Some pre-processing was done to these data, I think by Klaas Sys <klaas.sys@ilvo.vlaanderen.be>
+```
+
+### Load Norwegian shrimp survey data
+Add the Norwegian shrimp survey data. This is not of class `DATRASraw` but instead a .csv file, where each `RecordType` is just appended. Below is a script that subsets each `RecordType` into a separate object with correct headings.
+
+```{r}
+#| warning: false
+#| message: false
+
+# Read raw file lines
+lines <- read_lines(
+  paste0(home, "/data/NO_shrimp_survey_gadoids_DATRAS.csv")
+)
+
+# Find all header rows
+header_idx <- which(str_detect(lines, "^RecordType"))
+
+# Add artificial end position
+header_end <- c(header_idx[-1] - 1, length(lines))
+
+# Function to parse one block
+parse_block <- function(start, end) {
+  header <- lines[start]
+
+  # Determine record type from first data row
+  first_data <- lines[start + 1]
+  rec_type <- str_split(first_data, "\t|,", simplify = TRUE)[1]
+
+  # Extract lines for this block
+  block_lines <- lines[start:end]
+
+  # Create temporary text connection
+  block_text <- paste(block_lines, collapse = "\n")
+
+  # Read as dataframe
+  df <- read_delim(
+    I(block_text),
+    delim = ",",
+    show_col_types = FALSE,
+    trim_ws = TRUE
+  )
+
+  list(
+    type = rec_type,
+    data = df
+  )
+}
+
+# Parse all blocks
+blocks <- map2(header_idx, header_end, parse_block)
+
+# Combine blocks of same RecordType
+no_HH <- blocks |>
+  keep(~ .x$type == "HH") |>
+  map("data") |>
+  bind_rows()
+
+no_HL <- blocks |>
+  keep(~ .x$type == "HL") |>
+  map("data") |>
+  bind_rows() |>
+  tidylog::filter(!SpeciesCode == "126441") # Remove saithe
+
+no_CA <- blocks |>
+  keep(~ .x$type == "CA") |>
+  map("data") |>
+  bind_rows() |>
+  tidylog::filter(!SpeciesCode == "126441") # Remove saithe
+```
+
+### Summarise Norwegian data
+Note, this code is somewhat different from the pre-processed DATRAS data (!)
+
+```{r}
+#| warning: false
+#| message: false
+
+# Species metadata grid with settings
+species_thresh <- tibble(
+  species = c("cod", "had", "whg"),
+  SpeciesCode = c(126436, 126437, 126438),
+  threshold = c(35, 30, 27),
+)
+
+# Estimate length-weight parameters from CA data by year and survey
+lw <- no_CA |>
+  rename(
+    NoAtLngt = NumberAtLength,
+    LngtCm = LengthClass,
+    IndWgt = IndividualWeight
+  ) |>
+  mutate(
+    length_cm = LngtCm,
+    Quarter = as.factor(Quarter),
+    DoorType = as.factor(DoorType),
+    Year = as.factor(Year),
+    Survey = as.factor(Survey)
+  ) |>
+  filter(IndWgt > 0, LngtCm > 0) |>
+  tidyr::uncount(NoAtLngt) |>
+  group_by(Year, Survey) |>
+  group_modify(~ broom::tidy(lm(log(IndWgt) ~ log(length_cm), data = .x))) |>
+  ungroup() |>
+  dplyr::select(Year, Survey, term, estimate) |>
+  pivot_wider(names_from = term, values_from = estimate) |>
+  mutate(a = exp(`(Intercept)`), b = `log(length_cm)`) |>
+  dplyr::select(Year, Survey, a, b) |>
+  janitor::clean_names() |>
+  mutate(
+    b = if_else(b < 2.9 | b > 3.1, NA, b),
+    a = if_else(a < quantile(a, 0.2) | a > quantile(a, 0.8), NA, a)
+  )
+
+a_fallback <- median(lw$a, na.rm = TRUE)
+b_fallback <- median(lw$b, na.rm = TRUE)
+
+# Add count to HL data. First we need a haul.id so that we can join HH and HL
+no_HL <- no_HL |>
+  mutate(haul.id = paste(Year, Quarter, Country, "Ship", StationName, HaulNumber, sep = ":"))
+
+no_HH <- no_HH |>
+  mutate(haul.id = paste(Year, Quarter, Country, "Ship", StationName, HaulNumber, sep = ":"))
+
+no_HL <- no_HL |>
+  left_join(no_HH |>
+    distinct(haul.id, .keep_all = TRUE) |>
+    dplyr::select(haul.id, DataType, HaulDuration)) |>
+  mutate(
+    multiplier1 = ifelse(DataType == "C", HaulDuration / 60, 1),
+    multiplier2 = ifelse(!is.na(SubsamplingFactor), SubsamplingFactor, 1),
+    Count = NumberAtLength * multiplier1 * multiplier2
+  )
+
+# Summarise kg per haul, size-class and species
+by_size <- no_HL |>
+  rename(length_cm = LengthClass) |>
+  mutate(
+    Year = as.factor(Year),
+    LngtCm = length_cm,
+    Survey = as.factor(Survey)
+  ) |>
+  left_join(species_thresh, by = "SpeciesCode") |>
+  left_join(lw, by = c("Year" = "year", "Survey" = "survey")) |>
+  mutate(
+    Count = ifelse(Count < 0, NA, Count),
+    a = replace_na(a, a_fallback),
+    b = replace_na(b, b_fallback),
+    size_class = if_else(LngtCm < threshold, "small", "large"),
+    biomass_g = Count * a * LngtCm^b,
+    biomass_kg = biomass_g / 1000
+  ) |>
+  summarise(
+    n = sum(Count, na.rm = TRUE),
+    biomass_kg = sum(biomass_kg, na.rm = TRUE),
+    .by = c(haul.id, size_class, species)
+  )
+
+nor_d <- expand_grid(
+  haul.id = no_HH$haul.id,
+  size_class = c("small", "large"),
+  species = unique(by_size$species)
+) |>
+  left_join(by_size, by = c("haul.id", "size_class", "species")) |>
+  mutate(
+    n = replace_na(n, 0),
+    biomass_kg = replace_na(biomass_kg, 0)
+  ) |>
+  left_join(
+    no_HH |>
+      mutate(
+        Gear2 = "unspecified bottom trawl",
+        Survey = "Norwegian-Shrimp",
+        Ship = "Ship"
+      ) |>
+      rename(
+        lat = ShootLatitude,
+        lon = ShootLongitude,
+        HaulDur = HaulDuration
+      ) |>
+      dplyr::select(
+        haul.id, Year, Survey, lon, lat, Gear2, HaulDur, Ship, Month
+      ) |>
+      distinct(haul.id, .keep_all = TRUE),
+    by = "haul.id"
+  ) |>
+  rename(Gear = Gear2) |>
+  janitor::clean_names()
+```
+
+### DATRAS data
+
+Below is the function I use to iterate across the .Rdata files, and prepare it to a model-friendly summarize data frame ready for model fitting.
+
+```{r}
+#| warning: false
+#| message: false
+
+# Function to process data to get standardized response variable (kg/h) for a given species and cutoff size
+prepare_species_data <- function(file, threshold, ...) {
+  # Load the specific species Rdata file
+  load(paste0(home, "/data/datras_data_cod_had_whg_pok/", file, ".RData"))
+
+  # Estimate length-weight parameters from CA data by year and survey
+  lw <- dat$CA |>
+    drop_na(IndWgt, LngtClas) |>
+    filter(IndWgt > 0, LngtClas > 0) |>
+    tidyr::uncount(NoAtALK) |>
+    mutate(length_cm = ifelse(LngtCode == ".", LngtClas / 10, LngtClas)) |>
+    group_by(Year, Survey) |>
+    group_modify(~ broom::tidy(lm(log(IndWgt) ~ log(length_cm), data = .x))) |>
+    ungroup() |>
+    dplyr::select(Year, Survey, term, estimate) |>
+    pivot_wider(names_from = term, values_from = estimate) |>
+    mutate(a = exp(`(Intercept)`), b = `log(length_cm)`) |>
+    dplyr::select(Year, Survey, a, b) |>
+    janitor::clean_names() |>
+    mutate(
+      b = if_else(b < 2.9 | b > 3.1, NA, b),
+      a = if_else(a < quantile(a, 0.2) | a > quantile(a, 0.8), NA, a)
+    )
+
+  a_fallback <- median(lw$a, na.rm = TRUE)
+  b_fallback <- median(lw$b, na.rm = TRUE)
+
+  by_size <- dat$HL |>
+    left_join(lw, by = c("Year" = "year", "Survey" = "survey")) |>
+    mutate(
+      a = replace_na(a, a_fallback),
+      b = replace_na(b, b_fallback),
+      size_class = if_else(LngtCm < threshold, "small", "large"),
+      biomass_g = Count * a * LngtCm^b,
+      biomass_kg = biomass_g / 1000
+    ) |>
+    summarise(
+      n = sum(Count, na.rm = TRUE),
+      biomass_kg = sum(biomass_kg, na.rm = TRUE),
+      .by = c(haul.id, size_class)
+    )
+
+  d <- expand_grid( # <- Make an empty df with each haul id repeated for each size class
+    haul.id = dat$HH$haul.id,
+    size_class = c("small", "large")
+  ) |>
+    left_join(by_size,
+      by = c("haul.id", "size_class")
+    ) |> # <- Join observed catches by haul id
+    mutate(
+      n = replace_na(n, 0), # <- If no catches, n will be NA. Replace this with 0
+      biomass_kg = replace_na(biomass_kg, 0)
+    ) |>
+    left_join( # <- Add in HH columns
+      dat$HH |>
+        dplyr::select(
+          haul.id, Year, Survey, Gear, lon, lat,
+          Ship, HaulDur, Month
+        ),
+      by = "haul.id"
+    ) |>
+    janitor::clean_names() |>
+    filter(!is.na(haul_dur))
+
+  d
+}
+```
+
+That's the whole processing script to get kg/h for a give size class. Below is a script to run this for a give set of species and threshold sizes.
+
+```{r}
+#| warning: false
+#| message: false
+
+# Species metadata grid with settings
+species_grid <- tibble(
+  species = c("cod", "had", "whg"),
+  file = c("datras_data_cod", "datras_data_had", "datras_data_whg"), # "datras_data_pok"), # skipping saithe because few juveniles caught
+  threshold = c(35, 30, 27)
+) # Size thresholds
+
+# Loop function across all species
+dd <- list()
+
+for (i in 1:nrow(species_grid)) {
+  tryCatch(
+    {
+      sp <- species_grid$species[i]
+      file <- species_grid$file[i]
+      threshold <- species_grid$threshold[i]
+
+      dd[[i]] <- prepare_species_data(
+        file = file,
+        threshold = threshold
+      ) |>
+        mutate(
+          species = sp
+        )
+
+      cat("Prepared:", sp, "\n")
+    },
+    error = function(e) {
+      cat("ERROR preparing", sp, ":", conditionMessage(e), "\n")
+    }
+  )
+}
+
+datras_d <- bind_rows(dd)
+```
+
+### Combine Norwegian and DATRAS data
+
+```{r}
+#| warning: false
+#| message: false
+
+d <- bind_rows(
+  datras_d |>
+    mutate(year = as.numeric(as.character(year))),
+  nor_d |>
+    mutate(
+      haul_id = as.factor(haul_id),
+      month = as.integer(month)
+    )
+) |>
+  filter(year >= 1993) |>
+  to_lcc(lon = "lon", lat = "lat") |>
+  mutate(
+    quarter = ceiling(month / 3),
+    sp_sz = paste(species, size_class, sep = "_")
+  ) |>
+  mutate(
+    sp_sz = paste(species, size_class, sep = "_"),
+    sp_sz = fct_recode(
+      sp_sz,
+      "Cod < 35 cm" = "cod_small",
+      "Haddock < 30 cm" = "had_small",
+      "Whiting < 27 cm" = "whg_small",
+      "Cod ≥ 35 cm" = "cod_large",
+      "Haddock ≥ 30 cm" = "had_large",
+      "Whiting ≥ 27 cm" = "whg_large"
+    )
+  )
+```
+
+### Make a prediction grid
+
+```{r}
+#| warning: false
+#| message: false
+
+# Convert lat/lon to ETRS89-LAEA (EPSG:3035) projected coordinates to minimize distortion in the domain,
+# which is important because the model estimates the range of spatial autocorrelation,
+# specifically distance where correlation <0.13
+# Change to  them from metres to kilometres to help estimation
+
+# Using NOAA bathy from marmap to get depth raster. Likely there are more regional shapefiles
+# that have a higher resolution, but for now this will have to do
+
+# This is a fiddly grid but my normal approach of a convex hull of the sampling data doesn't play well with UK(!)
+grid_sf <- d |>
+  distinct(X, Y) |>
+  st_as_sf(coords = c("X", "Y"), crs = NA)
+
+hull <- concaveman(grid_sf, concavity = 2)
+# plot(hull)
+hull_buf <- st_buffer(hull, dist = 20)
+# plot(hull_buf)
+coords <- st_coordinates(hull_buf)[, 1:2]
+
+sp_poly <- sp::SpatialPolygons(
+  list(sp::Polygons(list(sp::Polygon(coords)), ID = 1))
+)
+sp_poly_df <- sp::SpatialPolygonsDataFrame(
+  sp_poly,
+  data = data.frame(ID = 1)
+)
+
+# Size of cell width (in km)
+cell_width <- 3
+
+spatial_grid <- expand.grid(
+  X = seq(min(d$X), max(d$X), cell_width),
+  Y = seq(min(d$Y), max(d$Y), cell_width)
+)
+
+sp::coordinates(spatial_grid) <- c("X", "Y")
+inside <- !is.na(sp::over(spatial_grid, as(sp_poly_df, "SpatialPolygons")))
+spatial_grid <- as.data.frame(spatial_grid[inside, ])
+
+pred_grid <- expand_grid(
+  spatial_grid,
+  year = sort(unique(d$year))
+) |>
+  mutate(
+    lon = st_coordinates(
+      st_transform(
+        st_as_sf(data.frame(X = X * 1000, Y = Y * 1000),
+          coords = c("X", "Y"), crs = crs_lcc
+        ), 4326
+      )
+    )[, 1],
+    lat = st_coordinates(
+      st_transform(
+        st_as_sf(data.frame(X = X * 1000, Y = Y * 1000),
+          coords = c("X", "Y"), crs = crs_lcc
+        ), 4326
+      )
+    )[, 2],
+    gear = as.factor("GOV"),
+    ship_f = factor(d$ship[1]),
+    time_shot_hour = 12,
+    haul_dur = 30,
+    haul_dur_sc = 0,
+    year_f = as.factor(year),
+    gear_f = as.factor(gear),
+    month = 8,
+    month_f = as.factor(month),
+    quarter_f = as.factor(3)
+  )
+
+# ggplot(pred_grid |> filter(year == 2002), aes(X, Y)) +
+#   geom_raster() +
+#   geom_point(data = d, aes(X, Y, color = "data"))
+
+# Add depth
+depth_box <- getNOAA.bathy(min(pred_grid$lon) - .1, max(pred_grid$lon) + .1, min(pred_grid$lat) - .1, max(pred_grid$lat) + .1)
+pred_grid$depth <- get.depth(depth_box, x = pred_grid$lon, y = pred_grid$lat, locator = F)$depth
+pred_grid$depth <- pred_grid$depth * (-1)
+
+pred_grid <- pred_grid |>
+  filter(depth > 1)
+
+# Scale depth (use that for data also)
+depth_mean <- mean(pred_grid$depth, na.rm = TRUE)
+depth_sd <- sd(pred_grid$depth, na.rm = TRUE)
+
+pred_grid <- pred_grid |>
+  mutate(
+    depth_sc = (depth - depth_mean) / depth_sd,
+    depth_sc2 = depth_sc^2
+  )
+
+# Test plot
+world <- ne_countries(scale = "medium", returnclass = "sf")
+world_lcc <- world |> st_transform(crs = crs_lcc)
+
+ggplot() +
+  geom_raster(
+    data = pred_grid |> filter(year == max(year)),
+    aes(x = X * 1000, y = Y * 1000, fill = depth)
+  ) +
+  scale_fill_viridis() +
+  geom_sf(data = world_lcc) +
+  coord_sf(
+    xlim = range(pred_grid$X) * 1000,
+    ylim = range(pred_grid$Y) * 1000,
+    crs = crs_lcc,
+    expand = 0
+  ) +
+  guides(fill = guide_colorbar(
+    title.position = "top", title.hjust = 0.5,
+    position = "inside", name = "Depth"
+  )) +
+  labs(x = "Easting (km)", y = "Northing (km)") +
+  theme(
+    axis.text.x = element_text(angle = 90),
+    legend.direction = "horizontal",
+    legend.position.inside = c(0.63, 0.057),
+    legend.key.width = unit(1, "cm")
+  )
+```
+
+### Explore data
+
+```{r}
+#| warning: false
+#| message: false
+
+data_plot <- ggplot() +
+  facet_wrap(~year, ncol = 7) +
+  geom_sf(data = world_lcc) +
+  coord_sf(
+    xlim = range(pred_grid$X),
+    ylim = range(pred_grid$Y),
+    crs = crs_lcc,
+    expand = 0
+  ) +
+  guides(color = guide_legend(
+    title.position = "top", title.hjust = 0.5,
+    position = "inside"
+  )) +
+  labs(x = "Easting (km)", y = "Northing (km)") +
+  theme(
+    axis.text.x = element_text(angle = 90),
+    legend.direction = "horizontal",
+    legend.position.inside = c(0.93, 0.08),
+    legend.key.width = unit(1, "cm")
+  )
+
+ggplot() +
+  geom_point(
+    data = d |> distinct(haul_id, .keep_all = TRUE),
+    aes(X * 1000, Y * 1000, color = as.factor(survey)),
+    alpha = 0.25, size = 0.75
+  ) +
+  geom_sf(data = world_lcc) +
+  theme(legend.position = "bottom") +
+  coord_sf(
+    xlim = range(d$X) * 1000,
+    ylim = range(d$Y) * 1000,
+    crs = crs_lcc,
+    expand = 0
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 0),
+    legend.direction = "horizontal",
+    legend.position.inside = c(0.96, 0.07),
+    legend.title = element_blank()
+  ) +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1))) +
+  labs(x = "Longitude", y = "Latitude") +
+  scale_color_brewer(palette = "Dark2", direction = -1)
+
+ggsave(paste0(home, "/figures/data/survey_map.png"), width = 13, height = 14.5, units = "cm")
+
+# Plot data by month/quarter
+ggplot() +
+  geom_point(
+    data = d |> distinct(haul_id, .keep_all = TRUE),
+    aes(X * 1000, Y * 1000, color = as.factor(survey)),
+    alpha = 0.25, size = 0.75
+  ) +
+  geom_sf(data = world_lcc) +
+  facet_wrap(~month) +
+  theme(legend.position = "bottom") +
+  coord_sf(
+    xlim = range(d$X) * 1000,
+    ylim = range(d$Y) * 1000,
+    crs = crs_lcc,
+    expand = 0
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 0),
+    legend.direction = "horizontal",
+    legend.position.inside = c(0.96, 0.07),
+    legend.title = element_blank()
+  ) +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1))) +
+  labs(x = "Longitude", y = "Latitude") +
+  scale_color_brewer(palette = "Dark2", direction = -1)
+
+
+ggplot() +
+  geom_point(
+    data = d |> distinct(haul_id, .keep_all = TRUE),
+    aes(X * 1000, Y * 1000, color = as.factor(survey)),
+    alpha = 0.25, size = 0.75
+  ) +
+  geom_sf(data = world_lcc) +
+  facet_wrap(~quarter) +
+  theme(legend.position = "bottom") +
+  coord_sf(
+    xlim = range(d$X) * 1000,
+    ylim = range(d$Y) * 1000,
+    crs = crs_lcc,
+    expand = 0
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 0),
+    legend.direction = "horizontal",
+    legend.position.inside = c(0.96, 0.07),
+    legend.title = element_blank()
+  ) +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1))) +
+  labs(x = "Longitude", y = "Latitude") +
+  scale_color_brewer(palette = "Dark2", direction = -1)
+
+# Combine quarters
+d <- d |>
+  mutate(
+    quarter_merge = ifelse(quarter %in% c(1, 2), 1.5, 3.5),
+    quarter_merge = as.factor(quarter_merge)
+  )
+
+ggplot() +
+  geom_point(
+    data = d |> distinct(haul_id, .keep_all = TRUE),
+    aes(X * 1000, Y * 1000, color = as.factor(survey)),
+    alpha = 0.25, size = 0.75
+  ) +
+  geom_sf(data = world_lcc) +
+  facet_wrap(~quarter_merge) +
+  theme(legend.position = "bottom") +
+  coord_sf(
+    xlim = range(d$X) * 1000,
+    ylim = range(d$Y) * 1000,
+    crs = crs_lcc,
+    expand = 0
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 0),
+    legend.direction = "horizontal",
+    legend.position.inside = c(0.96, 0.07),
+    legend.title = element_blank()
+  ) +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1))) +
+  labs(x = "Longitude", y = "Latitude") +
+  scale_color_brewer(palette = "Dark2", direction = -1)
+
+# Plot over time (decade)
+d <- d |>
+  mutate(decade = paste0(floor(year / 10) * 10, "s"))
+
+ggplot() +
+  geom_point(
+    data = d |> distinct(haul_id, .keep_all = TRUE),
+    aes(X * 1000, Y * 1000, color = as.factor(survey)),
+    alpha = 0.25, size = 0.75
+  ) +
+  geom_sf(data = world_lcc) +
+  facet_grid(quarter_merge ~ decade) +
+  theme(legend.position = "bottom") +
+  coord_sf(
+    xlim = range(d$X) * 1000,
+    ylim = range(d$Y) * 1000,
+    crs = crs_lcc,
+    expand = 0
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 0),
+    legend.direction = "horizontal",
+    legend.position.inside = c(0.96, 0.07),
+    legend.title = element_blank()
+  ) +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1))) +
+  labs(x = "Longitude", y = "Latitude") +
+  scale_color_brewer(palette = "Dark2", direction = -1)
+
+
+# Loop through all species*size combos and plot presence/absence over time.
+for (i in unique(d$sp_sz)) {
+  dd <- filter(d, sp_sz == i) |>
+    mutate(Presence = ifelse(biomass_kg == 0, "0", "1"))
+
+  data_plot +
+    geom_point(
+      data = dd,
+      size = 0.75,
+      aes(x = X * 1000, y = Y * 1000, color = Presence)
+    ) +
+    scale_color_brewer(palette = "Set1") +
+    geom_sf(data = world_lcc) +
+    coord_sf(
+      xlim = range(pred_grid$X) * 1000,
+      ylim = range(pred_grid$Y) * 1000,
+      crs = crs_lcc,
+      expand = 0
+    ) +
+    ggtitle(str_replace(i, "_", " "))
+
+  ggsave(paste0(home, "/figures/data/data_all_yrs_", dd$species[1], "_", dd$size_class[1], ".png"),
+    width = 20, height = 16
+  )
+}
+
+d |>
+  summarise(n = n(), .by = c(quarter, survey)) |>
+  ggplot(aes(quarter, n, fill = as.factor(quarter))) +
+  facet_wrap(~survey, scales = "free") +
+  geom_bar(stat = "identity")
+
+d |>
+  summarise(n = n(), .by = c(quarter, survey, year)) |>
+  ggplot(aes(year, n, fill = as.factor(quarter))) +
+  facet_wrap(~survey, scales = "free") +
+  scale_fill_brewer(palette = "Dark2") +
+  labs(fill = "Quarter", x = "Year") +
+  coord_cartesian(expand = 0) +
+  theme(legend.position = "bottom") +
+  geom_bar(stat = "identity")
+
+ggsave(paste0(home, "/figures/data/n_by_quarter.png"),
+       width = 8, height = 8)
+```
+
+### Prep data for models
+
+```{r}
+#| warning: false
+#| message: false
+
+d$depth <- get.depth(depth_box, x = d$lon, y = d$lat, locator = F)$depth
+d$depth <- d$depth * (-1)
+
+# ggplot(d |>
+#          distinct(haul_id, .keep_all = TRUE) |>
+#          mutate(depth2 = ifelse(depth > 0, "land", "water")),
+#        aes(X, Y, color = depth2)) +
+#   geom_point()
+
+d <- d |>
+  tidylog::filter(depth > 1)
+
+# Scale depth (use that for data also)
+d <- d |>
+  mutate(
+    depth_sc = (depth - depth_mean) / depth_sd,
+    depth_sc2 = depth_sc^2,
+    year_f = as.factor(year),
+    gear_f = as.factor(gear),
+    ship_f = as.factor(ship)
+  )
+
+# Replicate grid by new quarter variable to look at seasonality
+pred_grid <- pred_grid |>
+  replicate_df(
+    time_name = "quarter_merge",
+    time_values = as.factor(c(1.5, 3.5))
+  )
+```
+
+### Fit models
+
+Fit model to all species, save predictions
+
+```{r}
+#| warning: false
+#| message: false
+
+d <- d |>
+  tidylog::filter(!gear_f == "BT4P") |>
+  droplevels()
+
+tictoc::tic()
+
+# Loop through all data and models
+for (i in unique(d$sp_sz)) {
+  dat <- filter(d, sp_sz == i) |>
+    filter(biomass_kg < quantile(biomass_kg, probs = 0.999))
+
+  tryCatch(
+    {
+      cat("Fitting:", i, "\n")
+
+      mesh <- make_mesh(dat, xy_cols = c("X", "Y"), cutoff = 20)
+
+      m <- sdmTMB(
+        biomass_kg ~ 0 + quarter_merge + year_f + depth_sc + depth_sc2 + gear_f + (1 | ship_f),
+        data = dat,
+        mesh = mesh,
+        # family = delta_gamma(type = "poisson-link"),
+        family = tweedie(link = "log"),
+        offset = log(dat$haul_dur + 5),
+        spatial = "off",
+        spatial_varying = ~ 0 + quarter_merge,
+        spatiotemporal = "ar1",
+        time = "year"
+      )
+
+      saveRDS(m, paste0(home, "/output/m_", dat$species[1], "_", dat$size_class[1], ".rds"))
+
+      # Check residuals
+      res <- simulate(m, nsim = 300, type = "mle-mvn") |>
+        dharma_residuals(m, plot = FALSE)
+
+      p_res <- res |>
+        ggplot(aes(observed, expected)) +
+        geom_point(color = "grey30", shape = 21, size = 0.5) +
+        geom_abline(col = "tomato3", linewidth = 0.6) +
+        theme(aspect.ratio = 1) +
+        labs(
+          x = "Observed", y = "Expected",
+          title = paste("DHARMa residuals —", i)
+        )
+
+      ggsave(paste0(home, "/figures/supp/residuals_", dat$species[1], "_", dat$size_class[1], ".png"),
+        width = 13, height = 14.5
+      )
+
+      # Predict
+      p <- predict(
+        m,
+        newdata = pred_grid,
+        offset = log(as.numeric(pred_grid$haul_dur) + 5),
+        re_form_iid = NA
+      ) |>
+        mutate(
+          sp_sz = i
+        )
+
+      if (m$family$family == "tweedie") {
+        p <- p |> mutate(est = est)
+      } else {
+        p <- p |> mutate(est = est1 + est2)
+      }
+
+      saveRDS(p, paste0(home, "/output/pred_", dat$species[1], "_", dat$size_class[1], ".rds"))
+
+      # Predict with sims to get CV
+      cv_grid <- pred_grid |> filter(year_f %in% as.factor(2019:2024))
+
+      cv_svc <- predict(
+        m,
+        newdata = cv_grid,
+        re_form_iid = NA,
+        nsim = 200, sims_var = "zeta_s"
+      )
+
+      cv_est <- predict(
+        m,
+        newdata = cv_grid,
+        re_form_iid = NA,
+        nsim = 200, sims_var = "est"
+      )
+
+      cv_grid$q1_5_zeta <- apply(cv_svc$quarter_merge1.5, 1, sd)
+      cv_grid$q3_5_zeta <- apply(cv_svc$quarter_merge3.5, 1, sd)
+      cv_grid$est <- apply(cv_est, 1, sd)
+
+      cv_grid <- cv_grid |> mutate(sp_sz = i)
+
+      saveRDS(cv_grid, paste0(home, "/output/cv_grid_", dat$species[1], "_", dat$size_class[1], ".rds"))
+
+      # Save unique sims to illustrate stability in hotspots
+      sim_grid <- pred_grid |> filter(year_f %in% as.factor(2019:2024))
+
+      sim_grid <- sim_grid |>
+        mutate(sp_sz = i) |>
+        bind_cols(
+          cv_est |>
+            as_tibble() |>
+            dplyr::select(1:30) # Just save the first 30 sims
+        )
+
+      saveRDS(sim_grid, paste0(home, "/output/sim_grid_", dat$species[1], "_", dat$size_class[1], ".rds"))
+
+      cat("Done:", i, "\n")
+    },
+    error = function(e) {
+      cat("ERROR:", i, "\n")
+      cat(conditionMessage(e), "\n")
+    }
+  )
+}
+
+tictoc::tic()
+```
+
+Plotting is done in script 02
+
+```{r}
+#| warning: false
+#| message: false
+
+# Just a final check on the model convergence
+# All important stuff is good. The ln_smooth_sigma is typically large,
+# and might be better estimate on the full data set (all months)
+list.files(
+  path = paste0(home, "/output"),
+  pattern = "^m_.*\\.rds$",
+  full.names = TRUE
+) |>
+  set_names(~ tools::file_path_sans_ext(basename(.))) |>
+  map(readRDS) |>
+  map(sanity)
+```
+
+```{r}
+knitr::knit_exit()
+```
+
+## Testing quarter specific papers
+
+```{r}
+d2 <- d |>
+  tidylog::filter(!gear_f == "BT4P") |>
+  filter(sp_sz == "Cod < 35 cm") |>
+  droplevels()
+
+#--- Quarter-specific models
+d_1_5 <- d2 |> 
+  filter(biomass_kg < quantile(biomass_kg, probs = 0.999)) |> 
+  filter(quarter_merge == "1.5") |> droplevels()
+
+d_3_5 <- d2 |> 
+  filter(biomass_kg < quantile(biomass_kg, probs = 0.999)) |> 
+  filter(quarter_merge == "3.5") |> droplevels()
+
+mesh_1_5 <- make_mesh(d1_5, xy_cols = c("X", "Y"), cutoff = 20)
+mesh_3_5 <- make_mesh(d3_5, xy_cols = c("X", "Y"), cutoff = 20)
+
+m_1_5 <- sdmTMB(
+  biomass_kg ~ 0 + year_f + depth_sc + depth_sc2,# + gear_f + (1 | ship_f),
+  data = d_1_5,
+  mesh = mesh_1_5,
+  family = tweedie(link = "log"),
+  offset = log(d_1_5$haul_dur + 5),
+  spatial = "on",
+  spatiotemporal = "iid",
+  time = "year"
+)
+
+m_3_5 <- sdmTMB(
+  biomass_kg ~ 0 + year_f + depth_sc + depth_sc2,# + gear_f + (1 | ship_f),
+  data = d_3_5,
+  mesh = mesh_3_5,
+  family = tweedie(link = "log"),
+  offset = log(d_3_5$haul_dur + 5),
+  spatial = "on",
+  spatiotemporal = "iid",
+  time = "year"
+)
+
+# TODO SAVE THESE MODELS
+
+# Predict
+p_1_5 <- predict(
+  m_1_5,
+  newdata = pred_grid |> 
+    filter(quarter_merge == "1.5") |> 
+    filter(between(year, 2021, 2024)),
+  #offset = log(as.numeric(pred_grid$haul_dur) + 5),
+  re_form_iid = NA
+)
+
+p_3_5 <- predict(
+  m_3_5,
+  newdata = pred_grid |>
+    filter(quarter_merge == "3.5") |> 
+    filter(between(year, 2021, 2024)),
+  #offset = log(as.numeric(pred_grid$haul_dur) + 5),
+  re_form_iid = NA
+)
+
+# Load main model
+p_combi <- readRDS(paste0(home, "/output/pred_cod_small.rds")) |> 
+  filter(between(year, 2021, 2024))
+
+#--- Plot
+library(ggsidekick)
+
+p1 <- ggplot(p_combi, aes(X, Y, fill = exp(est))) +
+  geom_raster() + 
+  coord_sf() +
+  ggplot2::scale_fill_viridis_c(trans = "fourth_root_power") +
+  facet_grid(quarter_merge~year) + 
+  theme(axis.text.x = element_text(angle = 90))
+
+p1
+
+p_sep <- bind_rows(
+  p_1_5 |>
+    mutate(quarter_merge == "1.5"),
+  p_3_5 |>
+    mutate(quarter_merge == "3.5")
+)
+
+p2 <- ggplot(p_sep, aes(X, Y, fill = exp(est))) +
+  geom_raster() + 
+  coord_sf() +
+  ggplot2::scale_fill_viridis_c(trans = "fourth_root_power") +
+  facet_grid(quarter_merge~year) + 
+  theme(axis.text.x = element_text(angle = 90))
+
+p2
+
+library(patchwork)
+(p1 + ggtitle("Full model")) / (p2 + ggtitle("Separate model"))
+```

@@ -1,0 +1,640 @@
+---
+title: "Plotting model output"
+author: "Max Lindmark"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format: 
+  html:
+    toc: true
+    page-layout: full
+    embed-resources: true
+knitr: 
+  opts_chunk:
+    fig.align: center
+    out-width: 80%
+editor: source
+execute: 
+  echo: true
+  eval: true
+  cache: false
+---
+
+```{r}
+#| warning: false
+#| message: false
+
+library(ggplot2)
+library(sf)
+library(rnaturalearth)
+library(viridis)
+library(tidyr)
+library(dplyr)
+library(purrr)
+library(forcats)
+library(ggsidekick)
+library(raster)
+library(sf)
+
+theme_set(theme_sleek())
+
+home <- here::here()
+crs_lcc <- 3035 # ETRS89-LAEA
+# Map stuff
+world <- ne_countries(scale = "medium", returnclass = "sf")
+world_lcc <- world |> st_transform(crs = crs_lcc)
+
+# Base plot
+
+# Plot species
+data_plot <- ggplot() +
+  geom_sf(data = world_lcc) +
+  scale_fill_viridis(
+    trans = "sqrt",
+    breaks = scales::pretty_breaks(n = 3)
+  ) +
+  guides(fill = guide_colorbar(
+    title.position = "top", title.hjust = 0.5
+  )) +
+  theme(
+    legend.position = "bottom",
+    legend.key.height = unit(0.2, "cm"),
+    legend.key.width = unit(0.8, "cm")
+  ) +
+  labs(
+    x = "Longitude", y = "Latitude",
+    fill = "kg per 30 min"
+  )
+```
+
+### Plot predictions in space
+
+```{r}
+#| warning: false
+#| message: false
+
+# Load predictions
+# see this: https://stackoverflow.com/questions/38797714/reading-multiple-rds-files
+preds <- list.files(
+  path = paste0(home, "/output"),
+  pattern = "^pred.*\\.rds$",
+  full.names = TRUE
+) |>
+  map(readRDS) |>
+  bind_rows() |>
+  mutate(
+    sp_sz_code = fct_recode(
+      sp_sz,
+      "cod_small" = "Cod < 35 cm",
+      "had_small" = "Haddock < 30 cm",
+      "whg_small" = "Whiting < 27 cm",
+      "cod_large" = "Cod ≥ 35 cm",
+      "had_large" = "Haddock ≥ 30 cm",
+      "whg_large" = "Whiting ≥ 27 cm"
+    )
+  ) |>
+  mutate(
+    est = ifelse(est > quantile(est, probs = 0.9995), quantile(est, probs = 0.9995), est),
+    .by = c(sp_sz, quarter_merge)
+  ) |> 
+  filter(quarter_merge %in% c("1.5", "3.5"))
+
+
+
+for (i in unique(preds$sp_sz_code)) {
+  dd <- filter(preds, sp_sz_code == i)
+
+  for (j in unique(dd$quarter_merge)) {
+    # All years
+    data_plot +
+      geom_raster(
+        data = dd |> filter(quarter_merge == j),
+        aes(x = X * 1000, y = Y * 1000, fill = exp(est))
+      ) +
+      facet_wrap(~year, ncol = 7) +
+      geom_sf(data = world_lcc) +
+      coord_sf(
+        xlim = range(preds$X) * 1000,
+        ylim = range(preds$Y) * 1000,
+        crs = crs_lcc,
+        expand = 0
+      ) +
+      ggtitle(paste0(dd$sp_sz[1], ", Q", j))
+
+    ggsave(paste0(home, "/figures/predictions/pred_all_yrs_", i, j, ".png"), width = 22, height = 20, units = "cm")
+
+    # Selected years
+    data_plot +
+      geom_raster(
+        data = dd |>
+          filter(year_f %in% as.factor(2019:2024)) |>
+          filter(quarter_merge == j),
+        aes(x = X * 1000, y = Y * 1000, fill = exp(est))
+      ) +
+      facet_wrap(~year, nrow = 2) +
+      geom_sf(data = world_lcc) +
+      coord_sf(
+        xlim = range(preds$X) * 1000,
+        ylim = range(preds$Y) * 1000,
+        crs = crs_lcc,
+        expand = 0
+      ) +
+      ggtitle(paste0(dd$sp_sz[1], ", Q", j))
+
+    ggsave(paste0(home, "/figures/predictions/pred_recent_yrs_", i, j, ".png"), width = 19, height = 16, units = "cm")
+  }
+}
+```
+
+### Plot hotspots
+
+```{r}
+#| warning: false
+#| message: false
+
+# Comparing by and across hotspot by year and quarter
+for (i in unique(preds$sp_sz_code)) {
+  dd <- filter(preds, sp_sz_code == i)
+
+  dd_hs_across <- dd |>
+    filter(year_f %in% as.factor(2019:2024)) |>
+    mutate(
+      `Above 90% quantile` = ifelse(est > quantile(est, probs = 0.9), "1", "0"),
+      .by = c(quarter_merge)
+    )
+
+  dd_hs_by <- dd |>
+    filter(year_f %in% as.factor(2019:2024)) |>
+    mutate(
+      `Above 90% quantile` = ifelse(est > quantile(est, probs = 0.9), "1", "0"),
+      .by = c(year, quarter_merge)
+    )
+
+  # Across recent years/quarters
+  for (j in unique(dd$quarter_merge)) {
+    dd_hs_q <- dd_hs_across |> filter(quarter_merge == j)
+
+    hotspot_label <- dd_hs_q |>
+      summarise(sum_biom = sum(exp(est)), .by = c(`Above 90% quantile`, year)) |>
+      mutate(prop = sum_biom / sum(sum_biom), .by = year) |>
+      filter(`Above 90% quantile` == "1") |>
+      mutate(label = paste0("Prop. in hotspots: ", round(prop * 100, 1), "%"))
+
+    hotspot <- data_plot +
+      geom_raster(
+        data = dd_hs_q,
+        aes(x = X * 1000, y = Y * 1000, fill = `Above 90% quantile`)
+      ) +
+      scale_fill_manual(values = c("grey95", "forestgreen")) +
+      facet_wrap(~year, nrow = 2) +
+      geom_sf(data = world_lcc) +
+      theme(legend.position = "bottom") +
+      coord_sf(
+        xlim = range(preds$X) * 1000,
+        ylim = range(preds$Y) * 1000,
+        crs = crs_lcc,
+        expand = 0
+      ) +
+      guides(fill = guide_colorbar(
+        title.position = "top", title.hjust = 0.5,
+        position = "inside"
+      )) +
+      theme(
+        axis.text.x = element_text(angle = 0),
+        legend.direction = "horizontal",
+        legend.key.width = unit(0.3, "cm"),
+        legend.position.inside = c(0.95, 0.05),
+        legend.title = element_text(size = 6),
+        legend.text = element_text(size = 5),
+        legend.key = element_rect(color = "grey30", linewidth = 0.3)
+      ) +
+      guides(fill = guide_legend(
+        title.position = "top", title.hjust = 0.5,
+        position = "inside"
+      )) +
+      labs(
+        x = "Longitude", y = "Latitude",
+        fill = "Hotspot",
+        title = (paste0(dd$sp_sz[1], ", Q", j)),
+        caption = "Hotspot calculated across year×quarter"
+      )
+
+    hotspot +
+      geom_text(
+        data = hotspot_label,
+        aes(label = label),
+        x = -Inf, y = Inf,
+        hjust = -0.05, vjust = 1.5,
+        size = 2.5, inherit.aes = FALSE
+      )
+
+    ggsave(paste0(home, "/figures/hotspots/hotspot_recent_yrs_", i, j, ".png"), width = 19, height = 16, units = "cm")
+
+    # By recent years/quarters
+    hotspot_label <- dd_hs_by |>
+      summarise(sum_biom = sum(exp(est)), .by = c(`Above 90% quantile`, year)) |>
+      mutate(prop = sum_biom / sum(sum_biom), .by = year) |>
+      filter(`Above 90% quantile` == "1") |>
+      mutate(label = paste0("Prop. in hotspots: ", round(prop * 100, 1), "%"))
+
+    hotspot +
+      geom_raster(
+        data = dd_hs_by |>
+          filter(year_f %in% as.factor(2019:2024)) |>
+          mutate(
+            `Above 90% quantile` = ifelse(est > quantile(est, probs = 0.9), "1", "0"),
+            .by = c(year, quarter_merge)
+          ) |>
+          filter(quarter_merge == j),
+        aes(x = X * 1000, y = Y * 1000, fill = `Above 90% quantile`)
+      ) +
+      geom_sf(data = world_lcc) +
+      theme(legend.position = "bottom") +
+      coord_sf(
+        xlim = range(preds$X) * 1000,
+        ylim = range(preds$Y) * 1000,
+        crs = crs_lcc,
+        expand = 0
+      ) +
+      labs(
+        caption = "Hotspot calculated by year×quarter"
+      ) +
+      geom_text(
+        data = hotspot_label,
+        aes(label = label),
+        x = -Inf, y = Inf,
+        hjust = -0.05, vjust = 1.5,
+        size = 2.5, inherit.aes = FALSE
+      )
+
+    ggsave(paste0(home, "/figures/hotspots/hotspot_recent_yrs_byyear_", i, j, ".png"), width = 19, height = 16, units = "cm")
+  }
+}
+
+# Quarter 1, mean prediction at location in recent years, convert to hotspots
+# Comparing by and across hotspot by year and quarter
+# Across recent years/quarters
+
+pred_mean <- preds |>
+  filter(
+    year_f %in% as.factor(2019:2024),
+    quarter_merge == 1.5
+  ) |>
+  summarise(est = mean(est), .by = c(quarter_merge, X, Y, sp_sz)) |>
+  mutate(
+    `Above 90% quantile` = ifelse(est > quantile(est, probs = 0.9), "1", "0"),
+    .by = sp_sz
+  )
+
+data_plot +
+  geom_raster(
+    data = pred_mean,
+    aes(x = X * 1000, y = Y * 1000, fill = `Above 90% quantile`)
+  ) +
+  scale_fill_manual(values = c("grey95", "forestgreen")) +
+  facet_wrap(~ factor(sp_sz, levels = c(
+    "Cod < 35 cm", "Haddock < 30 cm", "Whiting < 27 cm",
+    "Cod ≥ 35 cm", "Haddock ≥ 30 cm", "Whiting ≥ 27 cm"
+  ))) +
+  geom_sf(data = world_lcc) +
+  theme(legend.position = "bottom") +
+  coord_sf(
+    xlim = range(preds$X) * 1000,
+    ylim = range(preds$Y) * 1000,
+    crs = crs_lcc,
+    expand = 0
+  ) +
+  guides(fill = guide_colorbar(
+    title.position = "top", title.hjust = 0.5,
+    position = "inside"
+  )) +
+  theme(
+    axis.text.x = element_text(angle = 0),
+    legend.direction = "horizontal",
+    legend.key.width = unit(0.3, "cm"),
+    # legend.position.inside = c(0.05, 0.97),
+    legend.position.inside = c(0.95, 0.05),
+    legend.title = element_text(size = 6),
+    legend.text = element_text(size = 5),
+    legend.key = element_rect(color = "grey30", linewidth = 0.3)
+  ) +
+  guides(fill = guide_legend(
+    title.position = "top", title.hjust = 0.5,
+    position = "inside"
+  )) +
+  labs(
+    x = "Longitude", y = "Latitude",
+    fill = "Hotspot",
+    caption = "Hotspot calculated on mean biomass across years, Q1.5"
+  )
+
+ggsave(paste0(home, "/figures/hotspots/avg_hotspot_recent_yrs.png"), width = 19, height = 16, units = "cm")
+```
+
+### Plot hotspots by subdivision
+
+```{r}
+#| warning: false
+#| message: false
+
+# Add ICES subdivisions
+shape <- shapefile("/Users/maxlindmark/Dropbox/Max work/R/pred-prey-overlap/data/shapefiles/ICES-StatRec-mapto-ICES-Areas/StatRec_map_Areas_Full_20170124.shp")
+
+pred_coord <- preds |>
+  distinct(lon, lat)
+
+pts <- SpatialPoints(cbind(pred_coord$lon, pred_coord$lat),
+  proj4string = CRS(proj4string(shape))
+)
+
+pred_coord$sub_div <- over(pts, shape)$Area_27
+
+# Plot by subdivision
+pred_mean_sd <- preds |>
+  filter(
+    year_f %in% as.factor(2019:2024),
+    quarter_merge == 1.5
+  ) |>
+  left_join(pred_coord, by = c("lon", "lat")) |>
+  filter(sub_div %in% c("4.b", "4.a", "6.a", "4.c", "3.a.20", "7.d")) |>
+  summarise(est = mean(est), .by = c(quarter_merge, X, Y, sp_sz, sub_div)) |>
+  mutate(
+    `Above 90% quantile` = ifelse(est > quantile(est, probs = 0.9), "1", "0"),
+    .by = c(sp_sz, sub_div)
+  )
+
+  for (i in unique(pred_mean_sd$sp_sz)) {
+    
+    pred_mean_sd_i <- pred_mean_sd |> filter(sp_sz == i)
+    
+    data_plot +
+      geom_raster(
+        data = pred_mean_sd_i |>
+          mutate(fill_var = ifelse(`Above 90% quantile` == "1", sub_div, NA)),
+        aes(x = X * 1000, y = Y * 1000, fill = fill_var)
+      ) +
+      scale_fill_brewer(palette = "Set1", na.value = "grey95") +
+      facet_wrap(~sub_div) +
+      geom_sf(data = world_lcc) +
+      theme(legend.position = "bottom") +
+      coord_sf(
+        xlim = range(preds$X) * 1000,
+        ylim = range(preds$Y) * 1000,
+        crs = crs_lcc,
+        expand = 0
+      ) +
+      guides(fill = guide_colorbar(
+        title.position = "top", title.hjust = 0.5,
+        position = "inside"
+      )) +
+      theme(
+        axis.text.x = element_text(angle = 0),
+        legend.direction = "horizontal",
+        legend.key.width = unit(0.3, "cm"),
+        legend.position.inside = c(0.05, 0.97),
+        # legend.position.inside = c(0.95, 0.05),
+        legend.title = element_text(size = 6),
+        legend.text = element_text(size = 5),
+        legend.key = element_rect(color = "grey30", linewidth = 0.3)
+      ) +
+      guides(fill = "none") +
+      labs(
+        x = "Longitude", y = "Latitude",
+        fill = "Hotspot",
+        title = i,
+        caption = "Hotspot calculated on mean biomass across years, by sub-division, Q1.5"
+      )
+
+    ggsave(paste0(home, "/figures/hotspots/subdiv/by_sd_avg_hotspot_recent_yrs_", i, ".png"), width = 19, height = 16, units = "cm")
+  }
+```
+
+### Plot CV
+
+```{r}
+#| warning: false
+#| message: false
+
+# Load predictions
+# see this: https://stackoverflow.com/questions/38797714/reading-multiple-rds-files
+cvs <- list.files(
+  path = paste0(home, "/output"),
+  pattern = "^cv.*\\.rds$",
+  full.names = TRUE
+) |>
+  map(readRDS) |>
+  bind_rows() |>
+  mutate(
+    sp_sz_code = fct_recode(
+      sp_sz,
+      "cod_small" = "Cod < 35 cm",
+      "had_small" = "Haddock < 30 cm",
+      "whg_small" = "Whiting < 27 cm",
+      "cod_large" = "Cod ≥ 35 cm",
+      "had_large" = "Haddock ≥ 30 cm",
+      "whg_large" = "Whiting ≥ 27 cm"
+    )
+  ) |>
+  filter(quarter_merge %in% c("1.5", "3.5")) |> 
+  mutate(quarter_merge = ifelse(quarter_merge == 1.5, "Quarter=1.5", "Quarter=3.5"))
+
+
+for (i in unique(cvs$sp_sz_code)) {
+  dd <- filter(cvs, sp_sz_code == i)
+
+  # est
+  data_plot +
+    geom_raster(
+      data = dd,
+      aes(x = X * 1000, y = Y * 1000, fill = est)
+    ) +
+    facet_wrap(~quarter_merge) +
+    scale_fill_viridis(option = "magma") +
+    labs(
+      fill = "CV (prediction)",
+      title = dd$sp_sz[1]
+    ) +
+    guides(
+      fill = guide_colorbar(
+        position = "inside",
+        title.position = "top", title.hjust = 0.5
+      )
+    ) +
+    theme(
+      legend.position.inside = c(0.91, 0.09),
+      legend.direction = "horizontal",
+      legend.key.width = unit(0.5, "cm")
+    ) +
+    geom_sf(data = world_lcc) +
+    coord_sf(
+      xlim = range(cvs$X) * 1000,
+      ylim = range(cvs$Y) * 1000,
+      crs = crs_lcc,
+      expand = 0
+    )
+
+  ggsave(paste0(home, "/figures/cv/cv_est_recent_yrs_", i, ".png"), width = 19, height = 11, units = "cm")
+
+  # SVC
+  data_plot +
+    geom_raster(
+      data = dd |>
+        pivot_longer(c("q1_5_zeta", "q3_5_zeta"), values_to = "cv", names_to = "qsvc") |>
+        mutate(qsvc = ifelse(qsvc == "q1_5_zeta", "Quarter=1.5", "Quarter=3.5")),
+      aes(x = X * 1000, y = Y * 1000, fill = cv)
+    ) +
+    facet_wrap(~qsvc) +
+    scale_fill_viridis(option = "magma") +
+    labs(
+      fill = "CV (SVC)",
+      title = dd$sp_sz[1]
+    ) +
+    guides(
+      fill = guide_colorbar(
+        position = "inside",
+        title.position = "top", title.hjust = 0.5
+      )
+    ) +
+    theme(
+      legend.position.inside = c(0.91, 0.09),
+      legend.direction = "horizontal",
+      legend.key.width = unit(0.5, "cm")
+    ) +
+    geom_sf(data = world_lcc) +
+    coord_sf(
+      xlim = range(cvs$X) * 1000,
+      ylim = range(cvs$Y) * 1000,
+      crs = crs_lcc,
+      expand = 0
+    )
+
+  ggsave(paste0(home, "/figures/cv/cv_svc_recent_yrs_", i, ".png"), width = 19, height = 11, units = "cm")
+}
+```
+
+### Plot uncertainty with sims
+
+```{r}
+#| warning: false
+#| message: false
+
+sims <- list.files(
+  path = paste0(home, "/output"),
+  pattern = "^sim.*\\.rds$",
+  full.names = TRUE
+) |>
+  map(readRDS) |>
+  bind_rows() |>
+  mutate(
+    sp_sz_code = fct_recode(
+      sp_sz,
+      "cod_small" = "Cod < 35 cm",
+      "had_small" = "Haddock < 30 cm",
+      "whg_small" = "Whiting < 27 cm",
+      "cod_large" = "Cod ≥ 35 cm",
+      "had_large" = "Haddock ≥ 30 cm",
+      "whg_large" = "Whiting ≥ 27 cm"
+    )
+  ) |> 
+  filter(quarter_merge %in% c("1.5", "3.5"))
+
+for (i in unique(sims$sp_sz_code)) {
+  dd <- filter(sims, sp_sz_code == i)
+
+  dd_sum <- dd |>
+    filter(year_f %in% as.factor(2021:2024)) |>
+    pivot_longer(V1:V30) |>
+    mutate(
+      hotspot = ifelse(value > quantile(value, probs = 0.9), 1, 0),
+      .by = c(year, quarter_merge, name)
+    ) |>
+    summarise(
+      `Hotspot stability` = mean(hotspot),
+      .by = c(X, Y, year, quarter_merge)
+    ) |>
+    mutate(quarter_merge = ifelse(quarter_merge == 1.5, "Quarter=1.5", "Quarter=3.5"))
+
+  data_plot +
+    geom_raster(
+      data = dd_sum, alpha = 0.9,
+      aes(x = X * 1000, y = Y * 1000, fill = `Hotspot stability`)
+    ) +
+    scale_fill_viridis(option = "mako") +
+    facet_grid(quarter_merge ~ year) +
+    geom_sf(data = world_lcc) +
+    theme(legend.position = "bottom") +
+    coord_sf(
+      xlim = range(dd_sum$X) * 1000,
+      ylim = range(dd_sum$Y) * 1000,
+      crs = crs_lcc,
+      expand = 0
+    ) +
+    labs(
+      x = "Longitude", y = "Latitude",
+      fill = "Hotspot persistence",
+      title = paste0(dd$sp_sz[1]),
+      caption = "Hotspot calculated across simulations"
+    )
+
+  ggsave(paste0(home, "/figures/hotspots/uncertainty/sims_hotspot_recent_yrs_", i, ".png"), width = 19, height = 13, units = "cm")
+}
+
+# Facet by sim!
+for (i in unique(sims$sp_sz_code)) {
+  dd <- filter(sims, sp_sz_code == i)
+
+  dd_sum <- dd |>
+    filter(
+      year_f %in% as.factor(c(2024)),
+      quarter_merge == "1.5"
+    ) |>
+    pivot_longer(V1:V12, names_to = "sim", values_to = "est") |>
+    mutate(
+      `Above 90% quantile` = ifelse(est > quantile(est, probs = 0.9), "1", "0"),
+      .by = c(quarter_merge, sim)
+    ) |>
+    mutate(
+      quarter_merge = ifelse(quarter_merge == 1.5, "Quarter=1.5", "Quarter=3.5"),
+      sim = as.numeric(stringr::str_remove(sim, "V"))
+    )
+
+  data_plot +
+    geom_raster(
+      data = dd_sum,
+      aes(x = X * 1000, y = Y * 1000, fill = `Above 90% quantile`)
+    ) +
+    scale_fill_manual(values = c("grey95", "forestgreen")) +
+    facet_wrap(~sim, nrow = 3) +
+    geom_sf(data = world_lcc) +
+    theme(legend.position = "bottom") +
+    coord_sf(
+      xlim = range(dd_sum$X) * 1000,
+      ylim = range(dd_sum$Y) * 1000,
+      crs = crs_lcc,
+      expand = 0
+    ) +
+    guides(fill = guide_colorbar(
+      title.position = "top", title.hjust = 0.5,
+      position = "inside"
+    )) +
+    theme(
+      axis.text.x = element_text(angle = 0),
+      legend.direction = "horizontal",
+      legend.key.width = unit(0.3, "cm"),
+      legend.position.inside = c(0.05, 0.97),
+      # legend.position.inside = c(0.95, 0.05),
+      legend.title = element_text(size = 6),
+      legend.text = element_text(size = 5)
+    ) +
+    guides(fill = guide_legend(
+      title.position = "top", title.hjust = 0.5,
+      position = "inside"
+    )) +
+    labs(
+      x = "Longitude", y = "Latitude",
+      fill = "Hotspot",
+      title = (paste0(dd$sp_sz[1])),
+      caption = "Hotspot calculated by sim, 2024, Q1.5"
+    )
+
+  ggsave(paste0(home, "/figures/hotspots/uncertainty/by_sims_hotspot_recent_yrs_", i, ".png"), width = 19, height = 17, units = "cm")
+}
+```

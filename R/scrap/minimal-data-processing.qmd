@@ -1,0 +1,247 @@
+---
+title: "Processing datras data for model fitting"
+author: "Max Lindmark"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format: 
+  html:
+    toc: true
+    page-layout: full
+    embed-resources: true
+knitr: 
+  opts_chunk:
+    fig.align: center
+    out-width: 80%
+editor: source
+execute: 
+  echo: true
+  eval: true
+  cache: false
+---
+
+```{r}
+#| warning: false
+#| message: false
+
+library(tibble)
+library(tidyr)
+library(dplyr)
+library(readr)
+library(stringr)
+library(purrr)
+
+home <- here::here()
+```
+
+```{r}
+#| warning: false
+#| message: false
+
+# Load data from DATRAS sent to me as RData, one for each species.
+# I believe some pre-processing was done to these data, I think by Klaas Sys <klaas.sys@ilvo.vlaanderen.be> 
+```
+
+### DATRAS data
+
+Below is the function I use to iterate across the .Rdata files, and prepare it to a model-friendly summarize data frame ready for model fitting.
+
+The reason we are working with kg instead of numbers per hour is that it gives us more flexibility when it comes to model distributions and thereby better residuals.
+
+```{r}
+# Function to process data to get standardized response variable (kg/h) for a given species and cutoff size
+prepare_species_data <- function(file, threshold, depth_mean, depth_sd, ...) {
+  
+  # Load the specific species Rdata file
+  load(paste0(home, "/data/datras_data_cod_had_whg_pok/", file, ".RData"))
+
+  # Estimate length-weight parameters from CA data by year and survey
+  lw <- tibble(a = 0.01, b = 3) # In the real script we estimate these by survey*year
+
+  by_size <- dat$HL |>
+    bind_cols(lw) |>
+    mutate(
+      size_class = if_else(LngtCm < threshold, "small", "large"),
+      biomass_g = Count * a * LngtCm^b, # <- Key column here! Count is not a DATRAS original column I think, hence I need to create that in the Norwegian data
+      biomass_kg = biomass_g / 1000
+    ) |>
+    summarise(
+      n = sum(Count, na.rm = TRUE),
+      biomass_kg = sum(biomass_kg, na.rm = TRUE),
+      a = first(a),
+      b = first(b),
+      .by = c(haul.id, size_class)
+    )
+
+  d <- expand_grid( # <- Make an empty df with each haul id repeated for each size class
+    haul.id = dat$HH$haul.id,
+    size_class = c("small", "large")
+  ) |> 
+    left_join(by_size, by = c("haul.id", "size_class")) |>  # <- Join observed catches by haul id
+    mutate(
+      n = replace_na(n, 0), # <- If no catches, n will be NA. Replace this with 0
+      biomass_kg = replace_na(biomass_kg, 0)
+    ) |>
+    left_join( # <- Add in HH columns
+      dat$HH |> dplyr::select(
+        haul.id, Year, Survey, Gear, lon, lat, Depth,
+        TimeShotHour, Ship, HaulDur, Month
+      ),
+      by = "haul.id"
+    ) |> 
+    janitor::clean_names() |>
+    filter(!is.na(haul_dur))
+    
+  d
+}
+```
+
+That's the whole processing script to get kg/h for a give size class. Below is a script to run this for a give set of species and threshold sizes.
+
+```{r}
+# Species metadata grid with settings
+species_grid <- tibble(
+  species = c("cod", "had", "whg"),
+  file = c("datras_data_cod", "datras_data_had", "datras_data_whg"), # "datras_data_pok"), # skipping saithe because few juveniles caught
+  threshold = c(35, 30, 27), # Size thresholds
+  cutoff = 15 # for mesh. Minimum distance between mesh verticies
+)
+
+# Loop function across all species
+dat <- list()
+
+for (i in 1:nrow(species_grid)) {
+  tryCatch(
+    {
+      sp <- species_grid$species[i]
+      file <- species_grid$file[i]
+      threshold <- species_grid$threshold[i]
+      cutoff <- species_grid$cutoff[i]
+
+      dat[[i]] <- prepare_species_data(
+        file = file,
+        threshold = threshold,
+        depth_mean = depth_mean,
+        depth_sd = depth_sd
+      ) |>
+        mutate(
+          species = sp,
+          threshold = threshold,
+          cutoff = cutoff
+        )
+
+      cat("Prepared:", sp, "\n")
+    },
+    error = function(e) {
+      cat("ERROR preparing", sp, ":", conditionMessage(e), "\n")
+    }
+  )
+}
+```
+
+### Norwegian shrimp survey
+
+Now we want to add the Norwegian shrimp survey data. This is not of class `DATRASraw` but instead a .csv file, where each `RecordType` is just appended. Below is a script that subsets each `RecordType` into a separate object with correct headings.
+
+```{r}
+#| warning: false
+#| message: false
+
+# Read raw file lines
+lines <- read_lines(
+  paste0(home, "/data/NO_shrimp_survey_gadoids_DATRAS.csv")
+)
+
+# Find all header rows
+header_idx <- which(str_detect(lines, "^RecordType"))
+
+# Add artificial end position
+header_end <- c(header_idx[-1] - 1, length(lines))
+
+# Function to parse one block
+parse_block <- function(start, end) {
+
+  header <- lines[start]
+
+  # Determine record type from first data row
+  first_data <- lines[start + 1]
+  rec_type <- str_split(first_data, "\t|,", simplify = TRUE)[1]
+
+  # Extract lines for this block
+  block_lines <- lines[start:end]
+
+  # Create temporary text connection
+  block_text <- paste(block_lines, collapse = "\n")
+
+  # Read as dataframe
+  df <- read_delim(
+    I(block_text),
+    delim = ",",
+    show_col_types = FALSE,
+    trim_ws = TRUE
+  )
+
+  list(
+    type = rec_type,
+    data = df
+  )
+}
+
+# Parse all blocks
+blocks <- map2(header_idx, header_end, parse_block)
+
+# Combine blocks of same RecordType
+no_HH <- blocks |>
+  keep(~ .x$type == "HH") |>
+  map("data") |>
+  bind_rows()
+
+no_HL <- blocks |>
+  keep(~ .x$type == "HL") |>
+  map("data") |>
+  bind_rows()
+
+no_CA <- blocks |>
+  keep(~ .x$type == "CA") |>
+  map("data") |>
+  bind_rows()
+```
+
+Now we have something that looks better. I have separate files for each `RecordType` in both the DATRAS data and the Norwegian data, and in theory I should be able to `bind_rows()` them before running `prepare_species_data()`.
+
+### Combine Norwegian shrimp survey data with DATRAS data
+
+```{r}
+# Check Norwegian HL data
+head(no_HL, 2) |> as.data.frame()
+
+# Check DATRAS HL data
+load(paste0(home, "/data/datras_data_cod_had_whg_pok/datras_data_cod.RData"))
+head(dat$HL, 2) |> as.data.frame()
+
+head(dat$HH$haul.id, 1) |> droplevels()
+head(dat$HH, 2) |> as.data.frame()
+
+# And check the column names in both HL files:
+sort(names(dat$HL))
+sort(names(no_HL))
+```
+
+Now, I can't just add these together because they differ in names and in number of columns. Some are easy; `LengthClass = LngtClas`, for example, but many are not.
+ggsave(paste0("figures/survey_map.png"), width = 13, height = 14.5, units = "cm")
+
+### Specific questions for you:
+
+* **Klaas Sys**: Is my approach correct? Is `Count` the column that indicates the total count of fish of that length class caught in that given haul? I.e., is it already raised to the haul if sub-sampled?
+
+* **Klaas Sys**: If so, how was the count column created, so that I can reproduce it with the Norwegian data (I assume it was created in an earlier step because I don't think it is a default column in DATRAS exchange)
+
+* **Norwegian**: Given that column names do not exactly match those of DATRAS exchange data, what would the corresponding calculation be on the shrimp data be to end up with what Klaas had done?
+
+
+```{r}
+hist(dat$HL$Count)
+
+summary(no_HL$NumberAtLength)
+summary(dat$HL$HLNoAtLngt)
+```
+
+
