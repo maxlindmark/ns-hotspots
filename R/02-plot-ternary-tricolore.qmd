@@ -1,0 +1,573 @@
+---
+title: "Ternary composition plot (tricolore package)"
+author: "Max Lindmark"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format:
+  html:
+    toc: true
+    page-layout: full
+    embed-resources: true
+knitr:
+  opts_chunk:
+    fig.align: center
+    out-width: 80%
+editor: source
+execute:
+  echo: true
+  eval: true
+  cache: false
+---
+
+Standalone script for the juvenile ternary composition plot, following the `tricolore` 
+package's own README as closely as possible: <https://github.com/jschoeley/tricolore>. 
+
+```{r}
+#| warning: false
+#| message: false
+
+library(ggplot2)
+library(ggtern)
+library(sf)
+library(rnaturalearth)
+library(tidyr)
+library(dplyr)
+library(purrr)
+library(forcats)
+library(ggsidekick)
+library(patchwork)
+library(tricolore)
+
+home <- here::here()
+crs_lcc <- 3035 # ETRS89-LAEA
+
+world <- ne_countries(scale = "medium", returnclass = "sf")
+world_lcc <- world |> st_transform(crs = crs_lcc)
+
+dir.create(paste0(home, "/figures/ternary"), showWarnings = FALSE, recursive = TRUE)
+```
+
+### Load predictions
+
+```{r}
+#| warning: false
+#| message: false
+
+preds <- list.files(
+  path = paste0(home, "/output"),
+  pattern = "^pred.*\\.rds$",
+  full.names = TRUE
+) |>
+  map(readRDS) |>
+  bind_rows() |>
+  mutate(
+    sp_sz_code = fct_recode(
+      sp_sz,
+      "cod_small" = "Cod < 35 cm",
+      "had_small" = "Haddock < 30 cm",
+      "whg_small" = "Whiting < 27 cm",
+      "cod_large" = "Cod ≥ 35 cm",
+      "had_large" = "Haddock ≥ 30 cm",
+      "whg_large" = "Whiting ≥ 27 cm"
+    )
+  ) |>
+  mutate(
+    est = ifelse(est > quantile(est, probs = 0.9995), quantile(est, probs = 0.9995), est),
+    .by = c(sp_sz, quarter_merge)
+  ) |>
+  filter(quarter_merge %in% c("1.5", "3.5"))
+```
+
+### Helper functions
+
+`build_comp()` sums density across whichever sp_sz_codes belong to a life
+stage (one code each for juvenile/adult, both for "combined", so juvenile +
+adult get added together per species before computing proportions) within
+each year first, then either keeps years separate (`by_year = TRUE`, for the
+faceted versions below) or averages across the given years into a single
+map (`by_year = FALSE`). The `tot` column it returns (summed density across
+the 3 species, a biomass proxy) is what the alpha-weighted maps below use.
+
+`sp_mixed` is a fourth composition scenario: adult cod vs juvenile haddock
+and juvenile whiting (as opposed to comparing same-stage abundances).
+
+```{r}
+#| warning: false
+#| message: false
+
+sp_juv <- c(cod_small = "cod", had_small = "had", whg_small = "whg")
+sp_adult <- c(cod_large = "cod", had_large = "had", whg_large = "whg")
+sp_both <- c(sp_juv, sp_adult)
+sp_mixed <- c(cod_large = "cod", had_small = "had", whg_small = "whg")
+
+build_comp <- function(preds, sp_map, years, by_year = FALSE) {
+  d <- preds |>
+    filter(year %in% years, sp_sz_code %in% names(sp_map)) |>
+    mutate(species = sp_map[as.character(sp_sz_code)], dens = exp(est)) |>
+    summarise(dens = sum(dens), .by = c(year, X, Y, species))
+
+  if (!by_year) {
+    d <- d |> summarise(dens = mean(dens), .by = c(X, Y, species))
+  }
+
+  d |>
+    pivot_wider(names_from = species, values_from = dens) |>
+    filter(!is.na(cod), !is.na(had), !is.na(whg)) |>
+    mutate(
+      tot = cod + had + whg,
+      p_cod = cod / tot, p_had = had / tot, p_whg = whg / tot
+    ) |>
+    filter(tot > 0) |>
+    mutate(x_m = X * 1000, y_m = Y * 1000)
+}
+```
+
+`make_ternary_key()` colour-codes a composition data frame with `Tricolore()`
+and builds the matching legend triangle. 
+`drop_thresh` (default `NULL` = off) masks cells where one species makes up
+at least that share of the total: they are coloured white instead, and left
+out of the colour key's data points. Since `Tricolore()` isn't centred
+on the data here, the remaining cells keep the same colours as in the
+unmasked maps.
+
+```{r}
+#| warning: false
+#| message: false
+
+make_ternary_key <- function(comp, bg_fill = "grey90", drop_thresh = NULL) {
+  dominated <- if (is.null(drop_thresh)) {
+    rep(FALSE, nrow(comp))
+  } else {
+    pmax(comp$p_cod, comp$p_had, comp$p_whg) >= drop_thresh
+  }
+  comp_kept <- comp[!dominated, ]
+  tric <- Tricolore(comp_kept, p1 = "p_had", p2 = "p_cod", p3 = "p_whg", show_data = FALSE, breaks = 10)
+  rgb <- rep("#FFFFFF", nrow(comp))
+  rgb[!dominated] <- tric$rgb
+  set.seed(1)
+  data_pts <- comp_kept[sample.int(nrow(comp_kept), min(500, nrow(comp_kept))), c("p_had", "p_cod", "p_whg")]
+  key <- tric$key +
+    labs(x = "Haddock", y = "Cod", z = "Whiting") +
+    theme(
+      plot.background = element_rect(fill = bg_fill, colour = NA),
+      tern.plot.background = element_rect(fill = bg_fill, colour = NA),
+      tern.panel.background = element_rect(fill = bg_fill, colour = NA),
+      tern.axis.title = element_text(size = 6.5),
+      tern.axis.text.show = FALSE,
+      tern.axis.ticks.primary.show = FALSE,
+      tern.axis.ticks.secondary.show = FALSE
+    ) +
+    layer(
+      geom = "point", stat = "identity", position = "identity",
+      mapping = aes(x = p_had, y = p_cod, z = p_whg),
+      data = data_pts,
+      params = list(size = 0.2, colour = "black", alpha = 0.2),
+      check.aes = FALSE
+    )
+  list(rgb = rgb, key = key)
+}
+```
+
+### Plots
+
+Follows the same convention as the hotspot script (`02-plot-hotspots.qmd`):
+per species-grouping x quarter, one map averaged over the recent-years
+window (`ternary_recent_yrs_*`, cf. `avg_hotspot_recent_yrs`) and one faceted
+by individual year (`ternary_recent_yrs_byyear_*`, cf.
+`hotspot_recent_yrs_byyear_*`). The averaged window is the most recent 6
+years of data (matching the hotspot script's 2019-2024 span, but computed
+relative to the latest year in `preds` so it doesn't go stale as new years
+are added). The by-year window is one year longer: 7 years on `nrow = 2,
+ncol = 4` leaves exactly the bottom-right grid cell free for the legend key.
+
+Each plot type below has its own chunk, looping over species grouping x
+quarter. To make or debug a single plot, set e.g. `comp_name <- "juvenile"`
+and `q <- "1.5"` and run the loop body.
+
+Variants:
+
+- `_alpha`: cell opacity mapped to `tot` (summed density across the 3
+  species, a biomass proxy), so low-biomass cells fade out while the colour
+  composition remains visible. `alpha_floor` keeps faded cells from going
+  fully transparent (0 = invisible, 1 = no fading at all).
+- `_mixonly`: cells where one species makes up >= `drop_thresh` of the
+  total are coloured white.
+
+```{r}
+#| warning: false
+#| message: false
+
+ref_year <- max(preds$year)
+years_recent <- (ref_year - 5):ref_year
+years_byyear <- (ref_year - 6):ref_year
+yr_recent_lab <- paste0(min(years_recent), "-", max(years_recent))
+
+comp_types <- list(
+  juvenile = list(map = sp_juv, label = "Juvenile community composition"),
+  adult = list(map = sp_adult, label = "Adult community composition"),
+  combined = list(map = sp_both, label = "Combined (juvenile + adult) community composition"),
+  mixed = list(map = sp_mixed, label = "Adult cod vs. juvenile haddock & whiting composition")
+)
+
+quarters <- c("1.5", "3.5")
+alpha_floor <- 0.1
+drop_thresh <- 0.95
+```
+
+#### Averaged across recent years
+
+```{r}
+#| warning: false
+#| message: false
+
+out_dir <- paste0(home, "/figures/ternary/avg")
+dir.create(out_dir, showWarnings = FALSE)
+
+for (comp_name in names(comp_types)) {
+  for (q in quarters) {
+    comp <- build_comp(preds |> filter(quarter_merge == q), comp_types[[comp_name]]$map, years_recent)
+    tk <- make_ternary_key(comp)
+    comp$col_rgb <- tk$rgb
+    xlim <- range(comp$x_m) + c(-1, 1) * 50000
+    ylim <- range(comp$y_m) + c(-1, 1) * 50000
+
+    p <- ggplot(comp) +
+      geom_raster(aes(x_m, y_m, fill = col_rgb)) +
+      geom_sf(data = world_lcc, fill = "grey90", colour = "grey60", linewidth = 0.2, inherit.aes = FALSE) +
+      scale_fill_identity() +
+      annotation_custom(
+        ggplotGrob(tk$key),
+        xmin = xlim[2] - 0.36 * diff(xlim), xmax = xlim[2] - 0.01 * diff(xlim),
+        ymin = ylim[1] + 0.02 * diff(ylim), ymax = ylim[1] + 0.29 * diff(ylim)
+      ) +
+      coord_sf(xlim = xlim, ylim = ylim, crs = crs_lcc, expand = 0) +
+      labs(
+        x = "Longitude", y = "Latitude",
+        title = paste0(comp_types[[comp_name]]$label, ", Q", q, ", ", yr_recent_lab)
+      ) +
+      theme_sleek()
+
+    ggsave(paste0(out_dir, "/ternary_recent_yrs_", comp_name, q, ".png"),
+           p, width = 14, height = 14, units = "cm", dpi = 300)
+  }
+}
+```
+
+#### Averaged across recent years, alpha = total biomass
+
+```{r}
+#| warning: false
+#| message: false
+
+out_dir <- paste0(home, "/figures/ternary/avg_alpha")
+dir.create(out_dir, showWarnings = FALSE)
+
+for (comp_name in names(comp_types)) {
+  for (q in quarters) {
+    comp <- build_comp(preds |> filter(quarter_merge == q), comp_types[[comp_name]]$map, years_recent)
+    tk <- make_ternary_key(comp)
+    comp$col_rgb <- tk$rgb
+    xlim <- range(comp$x_m) + c(-1, 1) * 50000
+    ylim <- range(comp$y_m) + c(-1, 1) * 50000
+
+    p <- ggplot(comp) +
+      geom_raster(aes(x_m, y_m, fill = col_rgb, alpha = tot)) +
+      geom_sf(data = world_lcc, fill = "grey90", colour = "grey60", linewidth = 0.2, inherit.aes = FALSE) +
+      scale_fill_identity() +
+      scale_alpha_continuous(
+        range = c(alpha_floor, 1),
+        limits = c(0, quantile(comp$tot, 0.99)),
+        oob = scales::squish,
+        name = "Total\nbiomass"
+      ) +
+      annotation_custom(
+        ggplotGrob(tk$key),
+        xmin = xlim[2] - 0.36 * diff(xlim), xmax = xlim[2] - 0.01 * diff(xlim),
+        ymin = ylim[1] + 0.02 * diff(ylim), ymax = ylim[1] + 0.29 * diff(ylim)
+      ) +
+      coord_sf(xlim = xlim, ylim = ylim, crs = crs_lcc, expand = 0) +
+      labs(
+        x = "Longitude", y = "Latitude",
+        title = paste0(comp_types[[comp_name]]$label, ", Q", q, ", ", yr_recent_lab, " (alpha = total biomass)")
+      ) +
+      theme_sleek() +
+      theme(
+        legend.position = "inside",
+        legend.position.inside = c(0.03, 0.03),
+        legend.justification = c(0, 0),
+        legend.background = element_rect(fill = alpha("white", 0.7), colour = NA)
+      )
+
+    ggsave(paste0(out_dir, "/ternary_recent_yrs_", comp_name, q, "_alpha.png"),
+           p, width = 14, height = 14, units = "cm", dpi = 300)
+  }
+}
+```
+
+#### Averaged across recent years, one-species cells masked
+
+```{r}
+#| warning: false
+#| message: false
+
+out_dir <- paste0(home, "/figures/ternary/avg_mixonly")
+dir.create(out_dir, showWarnings = FALSE)
+drop_thresh <- 0.8 
+
+for (comp_name in names(comp_types)) {
+  for (q in quarters) {
+    comp <- build_comp(preds |> filter(quarter_merge == q), comp_types[[comp_name]]$map, years_recent)
+    tk <- make_ternary_key(comp, drop_thresh = 0.8)
+    comp$col_rgb <- tk$rgb
+    xlim <- range(comp$x_m) + c(-1, 1) * 50000
+    ylim <- range(comp$y_m) + c(-1, 1) * 50000
+
+    p <- ggplot(comp) +
+      geom_raster(aes(x_m, y_m, fill = col_rgb)) +
+      geom_sf(data = world_lcc, fill = "grey90", colour = "grey60", linewidth = 0.2, inherit.aes = FALSE) +
+      scale_fill_identity() +
+      annotation_custom(
+        ggplotGrob(tk$key),
+        xmin = xlim[2] - 0.36 * diff(xlim), xmax = xlim[2] - 0.01 * diff(xlim),
+        ymin = ylim[1] + 0.02 * diff(ylim), ymax = ylim[1] + 0.29 * diff(ylim)
+      ) +
+      coord_sf(xlim = xlim, ylim = ylim, crs = crs_lcc, expand = 0) +
+      labs(
+        x = "Longitude", y = "Latitude",
+        title = paste0(comp_types[[comp_name]]$label, ", Q", q, ", ", yr_recent_lab, "\n",
+                       " (cells >=", drop_thresh * 100, "% one species in white)")
+      ) +
+      theme_sleek()
+
+    ggsave(paste0(out_dir, "/ternary_recent_yrs_", comp_name, q, "_mixonly.png"),
+           p, width = 14, height = 14, units = "cm", dpi = 300)
+  }
+}
+```
+
+#### Averaged across recent years, alpha = total biomass, one-species cells masked
+
+```{r}
+#| warning: false
+#| message: false
+
+out_dir <- paste0(home, "/figures/ternary/avg_alpha_mixonly")
+dir.create(out_dir, showWarnings = FALSE)
+drop_thresh <- 0.8
+  
+for (comp_name in names(comp_types)) {
+  for (q in quarters) {
+    comp <- build_comp(preds |> filter(quarter_merge == q), comp_types[[comp_name]]$map, years_recent)
+    tk <- make_ternary_key(comp, drop_thresh = drop_thresh)
+    comp$col_rgb <- tk$rgb
+    xlim <- range(comp$x_m) + c(-1, 1) * 50000
+    ylim <- range(comp$y_m) + c(-1, 1) * 50000
+
+    p <- ggplot(comp) +
+      geom_raster(aes(x_m, y_m, fill = col_rgb
+                      , alpha = tot
+                      )) +
+      geom_sf(data = world_lcc, fill = "grey90", colour = "grey60", linewidth = 0.2, inherit.aes = FALSE) +
+      scale_fill_identity() +
+      scale_alpha_continuous(
+        range = c(alpha_floor, 1),
+        limits = c(0, quantile(comp$tot, 0.99)),
+        oob = scales::squish,
+        name = "Total\nbiomass"
+      ) +
+      annotation_custom(
+        ggplotGrob(tk$key),
+        xmin = xlim[2] - 0.36 * diff(xlim), xmax = xlim[2] - 0.01 * diff(xlim),
+        ymin = ylim[1] + 0.02 * diff(ylim), ymax = ylim[1] + 0.29 * diff(ylim)
+      ) +
+      coord_sf(xlim = xlim, ylim = ylim, crs = crs_lcc, expand = 0) +
+      labs(
+        x = "Longitude", y = "Latitude",
+        title = paste0(comp_types[[comp_name]]$label, ", Q", q, ", ", yr_recent_lab, "\n",
+                       " (alpha = total biomass, cells >=", drop_thresh * 100, "% one species in white)")
+      ) +
+      theme_sleek() +
+      theme(
+        legend.position = "inside",
+        legend.position.inside = c(0.03, 0.03),
+        legend.justification = c(0, 0),
+        legend.background = element_rect(fill = alpha("white", 0.7), colour = NA)
+      )
+
+    ggsave(paste0(out_dir, "/ternary_recent_yrs_", comp_name, q, "_alpha_mixonly.png"),
+           p, width = 14, height = 14, units = "cm", dpi = 300)
+  }
+}
+```
+
+#### By year
+
+One shared colour key per figure (computed on the pooled, all-years data so
+colours are comparable across panels), placed once in the free bottom-right
+grid cell via `patchwork::inset_element`.
+
+```{r}
+#| warning: false
+#| message: false
+
+out_dir <- paste0(home, "/figures/ternary/byyear")
+dir.create(out_dir, showWarnings = FALSE)
+
+for (comp_name in names(comp_types)) {
+  for (q in quarters) {
+    comp <- build_comp(preds |> filter(quarter_merge == q), comp_types[[comp_name]]$map, years_byyear, by_year = TRUE)
+    tk <- make_ternary_key(comp, bg_fill = "white")
+    comp$col_rgb <- tk$rgb
+    xlim <- range(comp$x_m) + c(-1, 1) * 50000
+    ylim <- range(comp$y_m) + c(-1, 1) * 50000
+
+    p <- ggplot(comp) +
+      geom_raster(aes(x_m, y_m, fill = col_rgb)) +
+      geom_sf(data = world_lcc, fill = "grey90", colour = "grey60", linewidth = 0.2, inherit.aes = FALSE) +
+      scale_fill_identity() +
+      facet_wrap(~year, nrow = 2, ncol = 4) +
+      coord_sf(xlim = xlim, ylim = ylim, crs = crs_lcc, expand = 0) +
+      labs(x = "Longitude", y = "Latitude", title = paste0(comp_types[[comp_name]]$label, ", Q", q)) +
+      theme_sleek() +
+      theme(axis.text = element_text(size = 6), strip.text = element_text(size = 8)) +
+      inset_element(ggplotGrob(tk$key), left = 0.76, right = 0.99, bottom = 0.03, top = 0.47)
+
+    ggsave(paste0(out_dir, "/ternary_recent_yrs_byyear_", comp_name, q, ".png"),
+           p, width = 24, height = 14, units = "cm", dpi = 200)
+  }
+}
+```
+
+#### By year, alpha = total biomass
+
+```{r}
+#| warning: false
+#| message: false
+
+out_dir <- paste0(home, "/figures/ternary/byyear_alpha")
+dir.create(out_dir, showWarnings = FALSE)
+
+for (comp_name in names(comp_types)) {
+  for (q in quarters) {
+    comp <- build_comp(preds |> filter(quarter_merge == q), comp_types[[comp_name]]$map, years_byyear, by_year = TRUE)
+    tk <- make_ternary_key(comp, bg_fill = "white")
+    comp$col_rgb <- tk$rgb
+    xlim <- range(comp$x_m) + c(-1, 1) * 50000
+    ylim <- range(comp$y_m) + c(-1, 1) * 50000
+
+    p <- ggplot(comp) +
+      geom_raster(aes(x_m, y_m, fill = col_rgb, alpha = tot)) +
+      geom_sf(data = world_lcc, fill = "grey90", colour = "grey60", linewidth = 0.2, inherit.aes = FALSE) +
+      scale_fill_identity() +
+      scale_alpha_continuous(
+        range = c(alpha_floor, 1),
+        limits = c(0, quantile(comp$tot, 0.99)),
+        oob = scales::squish,
+        name = "Total\nbiomass"
+      ) +
+      facet_wrap(~year, nrow = 2, ncol = 4) +
+      coord_sf(xlim = xlim, ylim = ylim, crs = crs_lcc, expand = 0) +
+      labs(
+        x = "Longitude", y = "Latitude",
+        title = paste0(comp_types[[comp_name]]$label, ", Q", q, " (alpha = total biomass)")
+      ) +
+      theme_sleek() +
+      theme(
+        axis.text = element_text(size = 6), strip.text = element_text(size = 8),
+        legend.position = "bottom",
+        legend.key.height = unit(0.2, "cm"),
+        legend.key.width = unit(0.8, "cm")
+      ) +
+      inset_element(ggplotGrob(tk$key), left = 0.76, right = 0.99, bottom = 0.03, top = 0.47)
+
+    ggsave(paste0(out_dir, "/ternary_recent_yrs_byyear_", comp_name, q, "_alpha.png"),
+           p, width = 24, height = 14, units = "cm", dpi = 200)
+  }
+}
+```
+
+#### By year, one-species cells masked
+
+```{r}
+#| warning: false
+#| message: false
+
+out_dir <- paste0(home, "/figures/ternary/byyear_mixonly")
+dir.create(out_dir, showWarnings = FALSE)
+
+for (comp_name in names(comp_types)) {
+  for (q in quarters) {
+    comp <- build_comp(preds |> filter(quarter_merge == q), comp_types[[comp_name]]$map, years_byyear, by_year = TRUE)
+    tk <- make_ternary_key(comp, bg_fill = "white", drop_thresh = drop_thresh)
+    comp$col_rgb <- tk$rgb
+    xlim <- range(comp$x_m) + c(-1, 1) * 50000
+    ylim <- range(comp$y_m) + c(-1, 1) * 50000
+
+    p <- ggplot(comp) +
+      geom_raster(aes(x_m, y_m, fill = col_rgb)) +
+      geom_sf(data = world_lcc, fill = "grey90", colour = "grey60", linewidth = 0.2, inherit.aes = FALSE) +
+      scale_fill_identity() +
+      facet_wrap(~year, nrow = 2, ncol = 4) +
+      coord_sf(xlim = xlim, ylim = ylim, crs = crs_lcc, expand = 0) +
+      labs(
+        x = "Longitude", y = "Latitude",
+        title = paste0(comp_types[[comp_name]]$label, ", Q", q,
+                       " (cells >= ", drop_thresh * 100, "% one species in white)")
+      ) +
+      theme_sleek() +
+      theme(axis.text = element_text(size = 6), strip.text = element_text(size = 8)) +
+      inset_element(ggplotGrob(tk$key), left = 0.76, right = 0.99, bottom = 0.03, top = 0.47)
+
+    ggsave(paste0(out_dir, "/ternary_recent_yrs_byyear_", comp_name, q, "_mixonly.png"),
+           p, width = 24, height = 14, units = "cm", dpi = 200)
+  }
+}
+```
+
+#### By year, alpha = total biomass, one-species cells masked
+
+```{r}
+#| warning: false
+#| message: false
+
+out_dir <- paste0(home, "/figures/ternary/byyear_alpha_mixonly")
+dir.create(out_dir, showWarnings = FALSE)
+
+for (comp_name in names(comp_types)) {
+  for (q in quarters) {
+    comp <- build_comp(preds |> filter(quarter_merge == q), comp_types[[comp_name]]$map, years_byyear, by_year = TRUE)
+    tk <- make_ternary_key(comp, bg_fill = "white", drop_thresh = drop_thresh)
+    comp$col_rgb <- tk$rgb
+    xlim <- range(comp$x_m) + c(-1, 1) * 50000
+    ylim <- range(comp$y_m) + c(-1, 1) * 50000
+
+    p <- ggplot(comp) +
+      geom_raster(aes(x_m, y_m, fill = col_rgb, alpha = tot)) +
+      geom_sf(data = world_lcc, fill = "grey90", colour = "grey60", linewidth = 0.2, inherit.aes = FALSE) +
+      scale_fill_identity() +
+      scale_alpha_continuous(
+        range = c(alpha_floor, 1),
+        limits = c(0, quantile(comp$tot, 0.99)),
+        oob = scales::squish,
+        name = "Total\nbiomass"
+      ) +
+      facet_wrap(~year, nrow = 2, ncol = 4) +
+      coord_sf(xlim = xlim, ylim = ylim, crs = crs_lcc, expand = 0) +
+      labs(
+        x = "Longitude", y = "Latitude",
+        title = paste0(comp_types[[comp_name]]$label, ", Q", q,
+                       " (alpha = total biomass, cells >= ", drop_thresh * 100, "% one species in white)")
+      ) +
+      theme_sleek() +
+      theme(
+        axis.text = element_text(size = 6), strip.text = element_text(size = 8),
+        legend.position = "bottom",
+        legend.key.height = unit(0.2, "cm"),
+        legend.key.width = unit(0.8, "cm")
+      ) +
+      inset_element(ggplotGrob(tk$key), left = 0.76, right = 0.99, bottom = 0.03, top = 0.47)
+
+    ggsave(paste0(out_dir, "/ternary_recent_yrs_byyear_", comp_name, q, "_alpha_mixonly.png"),
+           p, width = 24, height = 14, units = "cm", dpi = 200)
+  }
+}
+```

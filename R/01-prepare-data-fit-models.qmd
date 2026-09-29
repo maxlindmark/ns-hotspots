@@ -510,8 +510,14 @@ depth_box <- getNOAA.bathy(min(pred_grid$lon) - .1, max(pred_grid$lon) + .1, min
 pred_grid$depth <- get.depth(depth_box, x = pred_grid$lon, y = pred_grid$lat, locator = F)$depth
 pred_grid$depth <- pred_grid$depth * (-1)
 
-pred_grid <- pred_grid |>
-  filter(depth > 1)
+# Removing land: a rectangular grid can include cells that fall on land, so
+# drop those using coastline polygons from Natural Earth, keeping only grid
+# nodes that fall in the sea (rather than relying on the depth threshold below)
+land <- st_union(st_make_valid(ne_countries(scale = 10, returnclass = "sf")))
+
+grid_sf <- st_as_sf(pred_grid, coords = c("lon", "lat"), crs = 4326, remove = FALSE)
+on_land <- lengths(st_intersects(grid_sf, land)) > 0
+pred_grid <- pred_grid[!on_land, ]
 
 # Scale depth (use that for data also)
 depth_mean <- mean(pred_grid$depth, na.rm = TRUE)
@@ -527,7 +533,7 @@ pred_grid <- pred_grid |>
 world <- ne_countries(scale = "medium", returnclass = "sf")
 world_lcc <- world |> st_transform(crs = crs_lcc)
 
-ggplot() +
+p2 <- ggplot() +
   geom_raster(
     data = pred_grid |> filter(year == max(year)),
     aes(x = X * 1000, y = Y * 1000, fill = depth)
@@ -542,7 +548,7 @@ ggplot() +
   ) +
   guides(fill = guide_colorbar(
     title.position = "top", title.hjust = 0.5,
-    position = "inside", name = "Depth"
+    position = "inside"
   )) +
   labs(x = "Easting (km)", y = "Northing (km)") +
   theme(

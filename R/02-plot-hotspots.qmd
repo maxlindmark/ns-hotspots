@@ -1,5 +1,5 @@
 ---
-title: "Plotting model output"
+title: "Plot predicted hotspots"
 author: "Max Lindmark"
 date: "`r format(Sys.time(), '%d %B, %Y')`"
 format: 
@@ -33,6 +33,7 @@ library(forcats)
 library(ggsidekick)
 library(raster)
 library(sf)
+library(patchwork)
 
 theme_set(theme_sleek())
 
@@ -336,7 +337,7 @@ ggsave(paste0(home, "/figures/hotspots/avg_hotspot_recent_yrs.png"), width = 19,
 #| message: false
 
 # Add ICES subdivisions
-shape <- shapefile("/Users/maxlindmark/Dropbox/Max work/R/pred-prey-overlap/data/shapefiles/ICES-StatRec-mapto-ICES-Areas/StatRec_map_Areas_Full_20170124.shp")
+shape <- shapefile("/Users/maxlindmark/Dropbox/max-work/R/pred-prey-overlap/data/shapefiles/ICES-StatRec-mapto-ICES-Areas/StatRec_map_Areas_Full_20170124.shp")
 
 pred_coord <- preds |>
   distinct(lon, lat)

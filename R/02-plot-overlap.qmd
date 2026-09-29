@@ -1,0 +1,361 @@
+---
+title: "Plotting overlap"
+author: "Max Lindmark"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format: 
+  html:
+    toc: true
+    page-layout: full
+    embed-resources: true
+knitr: 
+  opts_chunk:
+    fig.align: center
+    out-width: 80%
+editor: source
+execute: 
+  echo: true
+  eval: true
+  cache: false
+---
+
+```{r}
+#| warning: false
+#| message: false
+
+library(ggplot2)
+library(sf)
+library(rnaturalearth)
+library(viridis)
+library(tidyr)
+library(dplyr)
+library(purrr)
+library(forcats)
+library(ggsidekick)
+library(raster)
+library(sf)
+library(patchwork)
+library(mapplots)
+library(scatterpie)
+
+theme_set(theme_sleek())
+
+home <- here::here()
+crs_lcc <- 3035 # ETRS89-LAEA
+# Map stuff
+world <- ne_countries(scale = "medium", returnclass = "sf")
+world_lcc <- world |> st_transform(crs = crs_lcc)
+
+# Base plot
+
+# Plot species
+data_plot <- ggplot() +
+  geom_sf(data = world_lcc) +
+  scale_fill_viridis(
+    trans = "sqrt",
+    breaks = scales::pretty_breaks(n = 3)
+  ) +
+  guides(fill = guide_colorbar(
+    title.position = "top", title.hjust = 0.5
+  )) +
+  theme(
+    legend.position = "bottom",
+    legend.key.height = unit(0.2, "cm"),
+    legend.key.width = unit(0.8, "cm")
+  ) +
+  labs(
+    x = "Longitude", y = "Latitude",
+    fill = "kg per 30 min"
+  )
+```
+
+### Plot predictions in space
+
+```{r}
+#| warning: false
+#| message: false
+
+# Load predictions
+# see this: https://stackoverflow.com/questions/38797714/reading-multiple-rds-files
+preds <- list.files(
+  path = paste0(home, "/output"),
+  pattern = "^pred.*\\.rds$",
+  full.names = TRUE
+) |>
+  map(readRDS) |>
+  bind_rows() |>
+  mutate(
+    sp_sz_code = fct_recode(
+      sp_sz,
+      "cod_small" = "Cod < 35 cm",
+      "had_small" = "Haddock < 30 cm",
+      "whg_small" = "Whiting < 27 cm",
+      "cod_large" = "Cod ≥ 35 cm",
+      "had_large" = "Haddock ≥ 30 cm",
+      "whg_large" = "Whiting ≥ 27 cm"
+    )
+  ) |>
+  mutate(
+    est = ifelse(est > quantile(est, probs = 0.9995), quantile(est, probs = 0.9995), est),
+    .by = c(sp_sz, quarter_merge)
+  ) |> 
+  filter(quarter_merge %in% c("1.5", "3.5"))
+```
+
+### Plot overlap (sensu NL)
+
+```{r}
+to_lcc <- function(df, lon = "lon", lat = "lat") {
+  df |>
+    sf::st_as_sf(
+      coords = c(lon, lat),
+      crs = 4326,
+      remove = FALSE
+    ) |>
+    sf::st_transform(crs_lcc) |>
+    dplyr::mutate(
+      X = sf::st_coordinates(geometry)[, 1] / 1000,
+      Y = sf::st_coordinates(geometry)[, 2] / 1000
+    ) |>
+    sf::st_drop_geometry()
+}
+
+preds_nl <- preds |> 
+  mutate(ices_rect = ices.rect2(lon, lat)) |> 
+  filter(between(year, 2016, 2020)) |> 
+  summarise(est_natural = mean(exp(est)),
+            .by = c(ices_rect, quarter_merge, sp_sz))
+
+coords <- ices.rect(preds_nl$ices_rect)
+
+preds_nl_wide <- preds_nl |> 
+  mutate(lon = coords$lon,
+         lat = coords$lat) |> 
+  pivot_wider(names_from = sp_sz, values_from = est_natural)
+
+preds_nl_wide <- preds_nl_wide |> 
+  mutate(sum_juv = `Cod < 35 cm` + `Haddock < 30 cm` + `Whiting < 27 cm`,
+         juv_cod_prop = `Cod < 35 cm` / sum_juv,
+         juv_had_prop = `Haddock < 30 cm` / sum_juv,
+         juv_whi_prop = `Whiting < 27 cm` / sum_juv) |> 
+  to_lcc(lon = "lon", lat = "lat")
+
+spp <- c("Cod < 35 cm", "Haddock < 30 cm", "Whiting < 27 cm")
+r_max <- 25  # km
+
+juv_cols <- c(
+  "Cod < 35 cm"     = "#F6EBCA",
+  "Haddock < 30 cm" = "#98652B",
+  "Whiting < 27 cm" = "#1D746E"
+)
+
+pie_dat <- preds_nl_wide |>
+  filter(sum_juv > 0) |>
+  mutate(x_m = X * 1000,
+         y_m = Y * 1000,
+         r = 35000 * (sum_juv / max(sum_juv))^0.2)
+
+pie_dat <- pie_dat |>
+  mutate(all_5 = juv_cod_prop > 0.05 & juv_had_prop > 0.05 & juv_whi_prop > 0.05)
+
+ggplot() +
+  geom_sf(data = world_lcc) +
+  geom_scatterpie(
+    data = pie_dat,
+    alpha = 0.8,
+    cols = spp,
+    color = NA,
+    aes(x = x_m, y = y_m, r = r)
+  ) +
+  ggforce::geom_circle(
+    data = filter(pie_dat, all_5),
+    aes(x0 = x_m, y0 = y_m, r = r),
+    color = "tomato",
+    linewidth = 0.4,
+    inherit.aes = FALSE
+  ) +
+  scale_fill_manual(values = juv_cols) +
+  facet_wrap(~quarter_merge) +
+  coord_sf(
+    xlim = range(pie_dat$x_m) + c(-1, 1) * 50000,
+    ylim = range(pie_dat$y_m) + c(-1, 1) * 50000,
+    crs = crs_lcc,
+    expand = 0
+  ) +
+  labs(x = "Longitude", y = "Latitude", fill = NULL) +
+  theme(
+    legend.position = "bottom",
+    legend.key.height = unit(0.4, "cm"),
+    legend.key.width = unit(0.4, "cm")
+  )
+#ggsave(paste0(home, "/figures/test_pie.png"), width = 19, height = 10, units = "cm")
+```
+
+### Pairwise spatial overlap (Bhattacharyya's coefficient)
+
+Symmetric proportional co-occurrence between each pair of species: each
+species' density surface is normalised to proportions (sums to 1 across the
+grid), and BC = sum_i sqrt(p1i * p2i). Identical distributions give BC = 1,
+completely disjoint distributions give BC = 0. The per-cell term
+sqrt(p1i * p2i) is the map below; it sums to the reported BC, so the map and
+the number are the same quantity -- cells are bright only where *both*
+species hold a meaningful share of their own population, regardless of which
+is more abundant overall (Carroll et al. 2019).
+
+Same setup as `02-plot-ternary-tricolore.qmd`: a pooled map for the last 5
+years, and a year-faceted map for the last 20 years, saved to
+`figures/bc/`.
+
+```{r}
+#| warning: false
+#| message: false
+
+dir.create(paste0(home, "/figures/bc"), showWarnings = FALSE, recursive = TRUE)
+
+sp_labels <- c(cod = "Cod", had = "Haddock", whg = "Whiting")
+pairs <- list(c("cod", "had"), c("cod", "whg"), c("had", "whg"))
+
+# by_year = TRUE keeps year as a grouping variable (proportions normalised
+# WITHIN each year) instead of averaging density across years into one map
+# first.
+build_bc <- function(preds, years, by_year = FALSE) {
+  group_vars <- c(if (by_year) "year", "X", "Y", "species", "size_class")
+  d <- preds |>
+    filter(year %in% years) |>
+    mutate(
+      species = sub("_.*", "", sp_sz_code),
+      size_class = ifelse(grepl("large$", sp_sz_code), "Adult", "Juvenile"),
+      dens = exp(est)
+    ) |>
+    summarise(dens = mean(dens), .by = all_of(group_vars))
+
+  norm_vars <- c(if (by_year) "year", "size_class", "species")
+  d <- d |> mutate(p = dens / sum(dens), .by = all_of(norm_vars))
+
+  wide_id <- c(if (by_year) "year", "X", "Y", "size_class")
+  d_wide <- d |>
+    dplyr::select(all_of(c(wide_id, "species", "p"))) |>
+    pivot_wider(names_from = species, values_from = p, names_prefix = "p_", values_fill = 0)
+
+  bc_long <- map_dfr(pairs, function(sp) {
+    a <- paste0("p_", sp[1]); b <- paste0("p_", sp[2])
+    d_wide |>
+      mutate(
+        pair = paste(sp_labels[sp[1]], "–", sp_labels[sp[2]]),
+        term = sqrt(.data[[a]] * .data[[b]])
+      ) |>
+      dplyr::select(all_of(c(wide_id, "pair", "term")))
+  })
+
+  sum_vars <- c(if (by_year) "year", "size_class", "pair")
+  bc_summary <- bc_long |> summarise(BC = sum(term), .by = all_of(sum_vars))
+
+  list(long = bc_long, summary = bc_summary)
+}
+```
+
+```{r}
+#| warning: false
+#| message: false
+
+plot_bc_single <- function(bc, sc, title, out_file) {
+  d_summary <- bc$summary |> filter(size_class == sc)
+
+  # BC value folded straight into the facet strip text (e.g. "Cod -
+  # Haddock (BC = 0.74)") instead of a floating on-map label -- the strip
+  # always has a plain, consistent background, so there's no risk of it
+  # landing on the wrong part of the raster and becoming unreadable.
+  d <- bc$long |>
+    filter(size_class == sc) |>
+    left_join(d_summary, by = c("size_class", "pair")) |>
+    mutate(pair_lab = paste0(pair, " (BC = ", sprintf("%.2f", BC), ")"))
+
+  xlim <- range(d$X) * 1000 + c(-1, 1) * 50000
+  ylim <- range(d$Y) * 1000 + c(-1, 1) * 50000
+
+  p <- ggplot() +
+    geom_raster(data = d, aes(X * 1000, Y * 1000, fill = term)) +
+    geom_sf(data = world_lcc, fill = "grey90", colour = "grey60", linewidth = 0.2) +
+    scale_fill_viridis(
+      option = "magma", trans = "sqrt",
+      breaks = scales::pretty_breaks(n = 3)
+    ) +
+    facet_wrap(~pair_lab, nrow = 1) +
+    coord_sf(xlim = xlim, ylim = ylim, crs = crs_lcc, expand = 0) +
+    labs(x = "Longitude", y = "Latitude", fill = "sqrt(p1 x p2)", title = title) +
+    theme_sleek() +
+    theme(
+      legend.position = "bottom",
+      legend.key.height = unit(0.2, "cm"),
+      legend.key.width = unit(0.8, "cm"),
+      strip.text = element_text(size = 8)
+    )
+
+  ggsave(out_file, p, width = 21, height = 8, units = "cm", dpi = 300)
+  p
+}
+
+plot_bc_facets <- function(bc, sc, title, out_file) {
+  d <- bc$long |> filter(size_class == sc)
+
+  xlim <- range(d$X) * 1000 + c(-1, 1) * 50000
+  ylim <- range(d$Y) * 1000 + c(-1, 1) * 50000
+
+  p <- ggplot() +
+    geom_raster(data = d, aes(X * 1000, Y * 1000, fill = term)) +
+    geom_sf(data = world_lcc, fill = "grey90", colour = "grey60", linewidth = 0.2) +
+    scale_fill_viridis(
+      option = "magma", trans = "sqrt",
+      breaks = scales::pretty_breaks(n = 3)
+    ) +
+    facet_grid(pair ~ year) +
+    coord_sf(xlim = xlim, ylim = ylim, crs = crs_lcc, expand = 0) +
+    labs(x = "Longitude", y = "Latitude", fill = "sqrt(p1 x p2)", title = title) +
+    theme_sleek() +
+    theme(
+      legend.position = "bottom",
+      legend.key.height = unit(0.2, "cm"),
+      legend.key.width = unit(0.8, "cm"),
+      axis.text = element_text(size = 5),
+      strip.text = element_text(size = 7)
+    )
+
+  ggsave(out_file, p, width = 40, height = 14, units = "cm", dpi = 180)
+  p
+}
+```
+
+```{r}
+#| warning: false
+#| message: false
+
+ref_year <- max(preds$year)
+years_5 <- (ref_year - 4):ref_year
+years_20 <- (ref_year - 19):ref_year
+yr5_lab <- paste0(min(years_5), "-", max(years_5))
+yr20_lab <- paste0(min(years_20), "-", max(years_20))
+
+bc_pooled <- build_bc(preds, years_5)
+bc_facets <- build_bc(preds, years_20, by_year = TRUE)
+
+plot_bc_single(
+  bc_pooled, "Juvenile",
+  paste("Juvenile spatial overlap (Bhattacharyya's coefficient),", yr5_lab),
+  paste0(home, "/figures/bc/juvenile_", yr5_lab, ".png")
+)
+plot_bc_single(
+  bc_pooled, "Adult",
+  paste("Adult spatial overlap (Bhattacharyya's coefficient),", yr5_lab),
+  paste0(home, "/figures/bc/adult_", yr5_lab, ".png")
+)
+
+plot_bc_facets(
+  bc_facets, "Juvenile",
+  "Juvenile spatial overlap (Bhattacharyya's coefficient)",
+  paste0(home, "/figures/bc/juvenile_", yr20_lab, ".png")
+)
+plot_bc_facets(
+  bc_facets, "Adult",
+  "Adult spatial overlap (Bhattacharyya's coefficient)",
+  paste0(home, "/figures/bc/adult_", yr20_lab, ".png")
+)
+```
